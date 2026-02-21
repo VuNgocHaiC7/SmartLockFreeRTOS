@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hệ thống Khóa Thông Minh FreeRTOS</title>
+    <link rel="stylesheet" href="style.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  </head>
+  <body>
+    <!-- Toast Notification Container -->
+    <div id="toast-container"></div>
+
+    <div class="container">
+      <div id="login-screen">
+        <h2>🔐 Đăng Nhập Hệ Thống</h2>
+        <p
+          style="
+            text-align: center;
+            color: #6b7280;
+            margin-bottom: 30px;
+            font-weight: 500;
+            font-size: 15px;
+          "
+        >
+          <i class="fas fa-shield-alt" style="color: #4f46e5"></i> Điều Khiển
+          Khóa Thông Minh FreeRTOS
+        </p>
+
+        <input type="email" id="email" placeholder="📧 Nhập địa chỉ email..." />
+        <input
+          type="password"
+          id="password"
+          placeholder="🔑 Nhập mật khẩu..."
+        />
+
+        <button class="btn btn-primary" onclick="handleLogin()">
+          <i class="fas fa-sign-in-alt"></i><span>Đăng Nhập</span>
+        </button>
+        <p
+          id="login-msg"
+          style="
+            color: red;
+            text-align: center;
+            margin-top: 10px;
+            font-size: 14px;
+          "
+        ></p>
+      </div>
+
+      <div id="dashboard-screen" class="hidden">
+        <div class="header">
+          <div class="user-info">
+            <div class="user-avatar">
+              <i class="fas fa-user"></i>
+            </div>
+            <div>
+              <div class="status-badge">
+                <span id="status-dot" class="dot"></span>
+                <span id="status-text">Đã kết nối</span>
+              </div>
+              <div class="user-email" id="user-email">user@example.com</div>
+            </div>
+          </div>
+          <div class="header-actions">
+            <button
+              class="icon-btn"
+              onclick="toggleDarkMode()"
+              title="Chế độ tối"
+            >
+              <i class="fas fa-moon"></i>
+            </button>
+            <button class="btn btn-outline" onclick="handleLogout()">
+              <i class="fas fa-sign-out-alt"></i> Đăng Xuất
+            </button>
+          </div>
+        </div>
+
+        <!-- Tab Navigation -->
+        <div class="tab-navigation">
+          <button class="tab-btn active" onclick="switchTab('dashboard')">
+            <i class="fas fa-home"></i>
+            <span>Dashboard</span>
+          </button>
+          <button class="tab-btn" onclick="switchTab('stats')">
+            <i class="fas fa-chart-line"></i>
+            <span>Thống Kê</span>
+          </button>
+          <button class="tab-btn" onclick="switchTab('settings')">
+            <i class="fas fa-cog"></i>
+            <span>Cài Đặt</span>
+          </button>
+        </div>
+
+        <!-- Dashboard Tab Content -->
+        <div id="tab-dashboard" class="tab-content active">
+          <!-- Statistics Cards -->
+          <div class="stats-grid">
+            <div class="stat-card blue">
+              <div class="stat-icon">
+                <i class="fas fa-unlock"></i>
+              </div>
+              <div class="stat-details">
+                <div class="stat-label">Mở khóa hôm nay</div>
+                <div class="stat-value" id="stat-today">0</div>
+              </div>
+            </div>
+            <div class="stat-card green">
+              <div class="stat-icon">
+                <i class="fas fa-video"></i>
+              </div>
+              <div class="stat-details">
+                <div class="stat-label">Camera bật</div>
+                <div class="stat-value" id="stat-cam">0</div>
+              </div>
+            </div>
+            <div class="stat-card purple">
+              <div class="stat-icon">
+                <i class="fas fa-history"></i>
+              </div>
+              <div class="stat-details">
+                <div class="stat-label">Tổng hoạt động</div>
+                <div class="stat-value" id="stat-total">0</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="camera-container">
+            <div id="rec-indicator" class="rec-dot">● LIVE</div>
+            <img
+              id="cam-stream"
+              src=""
+              style="
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                display: none;
+              "
+            />
+
+            <div id="cam-placeholder" style="text-align: center">
+              <i
+                class="fas fa-video-slash"
+                style="font-size: 48px; margin-bottom: 15px; opacity: 0.4"
+              ></i>
+              <div style="font-size: 15px; font-weight: 600; opacity: 0.7">
+                Camera Đang Tắt
+              </div>
+              <div style="font-size: 12px; margin-top: 8px; opacity: 0.5">
+                Nhấn nút bên dưới để kích hoạt
+              </div>
+            </div>
+          </div>
+
+          <div class="control-grid">
+            <button
+              class="btn btn-success full-width"
+              onclick="sendCommand('UNLOCK')"
+            >
+              <i class="fas fa-unlock"></i><span>Mở Khóa</span>
+            </button>
+            <button class="btn btn-primary" onclick="sendCommand('CAM_ON')">
+              <i class="fas fa-video"></i><span>Bật Camera</span>
+            </button>
+            <button class="btn btn-danger" onclick="sendCommand('CAM_OFF')">
+              <i class="fas fa-video-slash"></i><span>Tắt Camera</span>
+            </button>
+          </div>
+
+          <h4 style="margin: 0 0 15px 0; font-size: 16px">
+            <i
+              class="fas fa-history"
+              style="color: #4f46e5; margin-right: 8px"
+            ></i
+            >Nhật Ký Hoạt Động
+          </h4>
+          <div class="log-box" id="log-list">
+            <div style="text-align: center; color: #999; padding: 20px">
+              Đang tải dữ liệu...
+            </div>
+          </div>
+        </div>
+
+        <!-- Statistics Tab Content -->
+        <div id="tab-stats" class="tab-content">
+          <h3 class="section-title">
+            <i class="fas fa-chart-bar"></i> Thống Kê Hoạt Động
+          </h3>
+
+          <div class="chart-container">
+            <canvas id="activityChart"></canvas>
+          </div>
+
+          <div class="stats-summary">
+            <div class="summary-card">
+              <div class="summary-icon" style="background: #4f46e5">
+                <i class="fas fa-calendar-week"></i>
+              </div>
+              <div class="summary-info">
+                <div class="summary-label">Tuần này</div>
+                <div class="summary-value" id="stat-week">0 lần</div>
+              </div>
+            </div>
+            <div class="summary-card">
+              <div class="summary-icon" style="background: #10b981">
+                <i class="fas fa-calendar-alt"></i>
+              </div>
+              <div class="summary-info">
+                <div class="summary-label">Tháng này</div>
+                <div class="summary-value" id="stat-month">0 lần</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="recent-activities">
+            <h4><i class="fas fa-clock"></i> Hoạt động gần đây nhất</h4>
+            <div id="recent-list" class="log-box"></div>
+          </div>
+        </div>
+
+        <!-- Settings Tab Content -->
+        <div id="tab-settings" class="tab-content">
+          <h3 class="section-title">
+            <i class="fas fa-sliders-h"></i> Cài Đặt
+          </h3>
+
+          <div class="settings-section">
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label">
+                  <i class="fas fa-bell"></i> Thông báo âm thanh
+                </div>
+                <div class="setting-desc">Phát âm thanh khi có hoạt động</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="sound-toggle" checked />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label">
+                  <i class="fas fa-lock-open"></i> Tự động khóa lại
+                </div>
+                <div class="setting-desc">Tự động khóa sau khi mở</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="auto-lock-toggle" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label">
+                  <i class="fas fa-clock"></i> Thời gian tự động khóa
+                </div>
+                <div class="setting-desc">Thời gian chờ trước khi khóa lại</div>
+              </div>
+              <select class="setting-select">
+                <option value="5">5 giây</option>
+                <option value="10" selected>10 giây</option>
+                <option value="30">30 giây</option>
+                <option value="60">60 giây</option>
+              </select>
+            </div>
+
+            <div class="setting-item">
+              <div class="setting-info">
+                <div class="setting-label">
+                  <i class="fas fa-video"></i> Chất lượng camera
+                </div>
+                <div class="setting-desc">Điều chỉnh chất lượng stream</div>
+              </div>
+              <select class="setting-select">
+                <option value="low">Thấp (360p)</option>
+                <option value="medium" selected>Trung bình (480p)</option>
+                <option value="high">Cao (720p)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="danger-zone">
+            <h4><i class="fas fa-exclamation-triangle"></i> Vùng nguy hiểm</h4>
+            <button class="btn btn-danger" onclick="clearAllLogs()">
+              <i class="fas fa-trash"></i><span>Xóa tất cả nhật ký</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Application JavaScript -->
+    <script type="module" src="featureWeb.js"></script>
+  </body>
+</html>
