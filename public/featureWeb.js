@@ -88,26 +88,21 @@ onAuthStateChanged(auth, (user) => {
 // ==================== COMMAND CONTROL ====================
 
 window.sendCommand = (cmd) => {
-  // Write command to Firebase
-  set(ref(db, "command"), {
-    action: cmd,
-    user: auth.currentUser.email,
-    timestamp: Date.now(),
-  });
+  set(ref(db, "command/action"), cmd);
+  const logRef = ref(db, "logs");
 
-  // UI Feedback
   if (cmd === "CAM_ON") {
-    ui.camPlaceholder.classList.add("hidden");
-    ui.recDot.style.display = "block";
+    ui.camStream.classList.add("hide");
     ui.camPlaceholder.innerHTML =
-      "<div style='color:#28a745'>Đang kết nối...</div>";
+      '<div class="cam-placeholder-content"><i class="fas fa-spinner fa-spin cam-placeholder-icon"></i><div class="cam-placeholder-title">Đang kết nối camera...</div><div class="cam-placeholder-subtitle">Vui lòng chờ ESP32 phản hồi</div></div>';
     ui.camPlaceholder.classList.remove("hidden");
-    showToast("📹 Camera đang được bật...", "info");
+    showToast("📹 Đã gửi lệnh bật camera...", "info");
   } else if (cmd === "CAM_OFF") {
-    ui.recDot.style.display = "none";
-    ui.camStream.style.display = "none";
+    ui.recDot.classList.remove("show");
+    ui.recDot.classList.add("hide");
+    ui.camStream.classList.add("hide");
     ui.camPlaceholder.innerHTML =
-      '<i class="fas fa-video-slash" style="font-size: 40px; margin-bottom: 10px; opacity: 0.5;"></i><div>Camera đang tắt</div>';
+      '<i class="fas fa-video-slash cam-placeholder-icon"></i><div class="cam-placeholder-title">Camera đang tắt</div>';
     ui.camPlaceholder.classList.remove("hidden");
     showToast("📴 Camera đã tắt", "success");
   } else if (cmd === "UNLOCK") {
@@ -188,11 +183,9 @@ function loadHistory() {
 
       updateChart();
     } else {
-      list.innerHTML =
-        "<div style='text-align:center; padding:10px; color:#999'>Chưa có dữ liệu</div>";
+      list.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
       if (recentList) {
-        recentList.innerHTML =
-          "<div style='text-align:center; padding:10px; color:#999'>Chưa có dữ liệu</div>";
+        recentList.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
       }
     }
   });
@@ -201,41 +194,65 @@ function loadHistory() {
 // ==================== CAMERA LISTENER ====================
 function listenToCameraIP() {
   const camRef = ref(db, "cam_ip");
+  const ipInfoBox = document.getElementById("camera-ip-info");
+  const ipText = document.getElementById("camera-ip-text");
 
   onValue(camRef, (snapshot) => {
     const streamUrl = snapshot.val();
 
     // Nếu có link stream và không phải là lệnh "OFF"
     if (streamUrl && streamUrl !== "OFF") {
-      console.log("Nhận được link stream:", streamUrl);
+      console.log("✅ Nhận được link stream từ Firebase:", streamUrl);
+
+      // Hiển thị IP info box
+      if (ipInfoBox && ipText) {
+        ipInfoBox.classList.add("show");
+        ipText.textContent = streamUrl;
+        ipText.className = "camera-ip-text ip-status-connected";
+      }
 
       // 1. Gán link vào thẻ img
       ui.camStream.src = streamUrl;
 
       // 2. Hiển thị thẻ img, ẩn placeholder
-      ui.camStream.style.display = "block";
+      ui.camStream.classList.remove("hide");
+      ui.camStream.classList.add("show");
       ui.camPlaceholder.classList.add("hidden");
 
       // 3. Hiển thị chấm đỏ REC
-      ui.recDot.style.display = "block";
+      ui.recDot.classList.add("show");
+      ui.recDot.classList.remove("hide");
 
       // 4. Cập nhật trạng thái text
       showToast("🎥 Đã kết nối Camera!", "success");
     } else {
       // Nếu là OFF hoặc không có dữ liệu
-      console.log("Camera đã tắt");
+      console.log("⚠️ Camera chưa kết nối hoặc đã tắt");
+
+      // Cập nhật IP info box
+      if (ipInfoBox && ipText) {
+        if (streamUrl === "OFF") {
+          ipText.textContent = "Camera đã tắt";
+          ipText.className = "camera-ip-text ip-status-disconnected";
+        } else {
+          ipText.textContent = "Chờ ESP32 kết nối...";
+          ipText.className = "camera-ip-text ip-status-waiting";
+        }
+      }
 
       // 1. Ẩn thẻ img
-      ui.camStream.style.display = "none";
+      ui.camStream.classList.add("hide");
+      ui.camStream.classList.remove("show");
       ui.camStream.src = ""; // Ngắt kết nối để tiết kiệm băng thông
 
       // 2. Hiện lại placeholder
       ui.camPlaceholder.innerHTML =
-        '<i class="fas fa-video-slash" style="font-size: 40px; margin-bottom: 10px; opacity: 0.5;"></i><div>Camera đang tắt</div>';
+        '<i class="fas fa-video-slash cam-placeholder-icon"></i><div class="cam-placeholder-title">Camera đang tắt</div>';
       ui.camPlaceholder.classList.remove("hidden");
 
       // 3. Ẩn chấm đỏ
-      ui.recDot.style.display = "none";
+      ui.recDot.classList.add("hide");
+      ui.recDot.classList.remove("show");
     }
   });
 }
