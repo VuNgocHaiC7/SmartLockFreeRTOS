@@ -1,35 +1,4 @@
-// app.js - Smart Lock FreeRTOS Controller
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
-import {
-  getDatabase,
-  ref,
-  set,
-  onValue,
-} from "https://www.gstatic.com/firebasejs/10.8.0/firebase-database.js";
-import {
-  getAuth,
-  signInWithEmailAndPassword,
-  signOut,
-  onAuthStateChanged,
-} from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
-
-// Firebase Configuration
-const firebaseConfig = {
-  apiKey: "AIzaSyCaLdNOZa8g8vY4rb0hn3GhF4-JYNTEYlc",
-  authDomain: "smartlockfreertos.firebaseapp.com",
-  databaseURL:
-    "https://smartlockfreertos-default-rtdb.asia-southeast1.firebasedatabase.app",
-  projectId: "smartlockfreertos",
-  storageBucket: "smartlockfreertos.firebasestorage.app",
-  messagingSenderId: "1081953224610",
-  appId: "1:1081953224610:web:5971fa08c316fd6da6d4fb",
-  measurementId: "G-CQE013KTRY",
-};
-
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const db = getDatabase(app);
-const auth = getAuth(app);
+// app.js - Smart Lock Local Controller (No Firebase)
 
 // UI Elements
 const ui = {
@@ -45,222 +14,447 @@ const ui = {
 // Global Variables
 let activityChart = null;
 let statsData = { today: 0, week: 0, month: 0, cam: 0, total: 0 };
+let espBaseUrl = "";
+let isDiscoveringController = false;
+let cameraStatusPollTimer = null;
+let isCameraUiOn = false;
 
-// ==================== AUTHENTICATION ====================
+// ==================== AUTHENTICATION (MOCK LOCAL) ====================
 
-// Login Handler
 window.handleLogin = () => {
-  const email = document.getElementById("email").value;
-  const pass = document.getElementById("password").value;
-  ui.loginMsg.innerText = "Đang xác thực...";
+  const email = document.getElementById("email").value.trim();
+  const pass = document.getElementById("password").value.trim();
 
-  signInWithEmailAndPassword(auth, email, pass).catch((error) => {
-    ui.loginMsg.innerText = "Lỗi: Sai tài khoản hoặc mật khẩu!";
-  });
-};
+  if (email === "" || pass === "") {
+    ui.loginMsg.innerText = "Vui lòng nhập Email và Mật khẩu!";
+    return;
+  }
 
-// Logout Handler
-window.handleLogout = () => {
-  signOut(auth);
-};
+  ui.loginMsg.innerText = "Đang kết nối mạng Local...";
 
-// Auth State Observer
-onAuthStateChanged(auth, (user) => {
-  if (user) {
-    // User logged in -> Show Dashboard
+  // Giả lập độ trễ đăng nhập 0.5s cho giống thật
+  setTimeout(async () => {
     ui.loginScreen.classList.add("hidden");
     ui.dashScreen.classList.remove("hidden");
     ui.statusDot.classList.add("online");
-    document.getElementById("user-email").innerText = user.email;
+    document.getElementById("user-email").innerText = email;
+
+    await initLocalController();
+    startCameraStatusSync();
     loadHistory();
     initChart();
-
-    listenToCameraIP();
-  } else {
-    // User logged out -> Show Login
-    ui.loginScreen.classList.remove("hidden");
-    ui.dashScreen.classList.add("hidden");
-    ui.statusDot.classList.remove("online");
-    ui.loginMsg.innerText = "";
-  }
-});
-
-// ==================== COMMAND CONTROL ====================
-
-window.sendCommand = (cmd) => {
-  set(ref(db, "command/action"), cmd);
-  const logRef = ref(db, "logs");
-
-  if (cmd === "CAM_ON") {
-    ui.camStream.classList.add("hide");
-    ui.camPlaceholder.innerHTML =
-      '<div class="cam-placeholder-content"><i class="fas fa-spinner fa-spin cam-placeholder-icon"></i><div class="cam-placeholder-title">Đang kết nối camera...</div><div class="cam-placeholder-subtitle">Vui lòng chờ ESP32 phản hồi</div></div>';
-    ui.camPlaceholder.classList.remove("hidden");
-    showToast("📹 Đã gửi lệnh bật camera...", "info");
-  } else if (cmd === "CAM_OFF") {
-    ui.recDot.classList.remove("show");
-    ui.recDot.classList.add("hide");
-    ui.camStream.classList.add("hide");
-    ui.camPlaceholder.innerHTML =
-      '<i class="fas fa-video-slash cam-placeholder-icon"></i><div class="cam-placeholder-title">Camera đang tắt</div>';
-    ui.camPlaceholder.classList.remove("hidden");
-    showToast("📴 Camera đã tắt", "success");
-  } else if (cmd === "UNLOCK") {
-    showToast("🔓 Đã gửi lệnh mở khóa!", "success");
-  }
+    showToast("✅ Đăng nhập mạng Local thành công!", "success");
+  }, 500);
 };
 
-// ==================== DATA & STATISTICS ====================
+window.handleLogout = () => {
+  stopCameraStatusSync();
+  ui.loginScreen.classList.remove("hidden");
+  ui.dashScreen.classList.add("hidden");
+  ui.statusDot.classList.remove("online");
+  ui.loginMsg.innerText = "";
+  setCameraUiState(false);
+};
 
-function loadHistory() {
-  onValue(ref(db, "logs"), (snapshot) => {
-    const data = snapshot.val();
-    const list = document.getElementById("log-list");
-    const recentList = document.getElementById("recent-list");
-    list.innerHTML = "";
+// ==================== LOCAL CONTROLLER ====================
 
-    // Reset stats
-    statsData = { today: 0, week: 0, month: 0, cam: 0, total: 0 };
-
-    if (data) {
-      const keys = Object.keys(data).slice(-10).reverse();
-      const allKeys = Object.keys(data);
-
-      // Calculate statistics
-      const now = Date.now();
-      const oneDayAgo = now - 24 * 60 * 60 * 1000;
-      const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
-      const oneMonthAgo = now - 30 * 24 * 60 * 60 * 1000;
-
-      allKeys.forEach((key) => {
-        const item = data[key];
-        const timestamp = item.timestamp || Date.now();
-        const action = typeof item === "object" ? item.action : item;
-
-        statsData.total++;
-
-        if (timestamp > oneDayAgo) {
-          if (action === "UNLOCK" || action?.includes("khóa"))
-            statsData.today++;
-        }
-        if (timestamp > oneWeekAgo) {
-          statsData.week++;
-        }
-        if (timestamp > oneMonthAgo) {
-          statsData.month++;
-        }
-        if (action === "CAM_ON" || action?.includes("Camera")) {
-          statsData.cam++;
-        }
-      });
-
-      // Update stat cards
-      document.getElementById("stat-today").innerText = statsData.today;
-      document.getElementById("stat-cam").innerText = statsData.cam;
-      document.getElementById("stat-total").innerText = statsData.total;
-      document.getElementById("stat-week").innerText = statsData.week + " lần";
-      document.getElementById("stat-month").innerText =
-        statsData.month + " lần";
-
-      // Display logs
-      keys.forEach((key) => {
-        const item = data[key];
-        let msg = typeof item === "object" ? item.msg || item.action : item;
-        let time = new Date(item.timestamp || Date.now()).toLocaleTimeString(
-          "vi-VN",
-        );
-
-        const div = document.createElement("div");
-        div.className = "log-item";
-        div.innerHTML = `<span>${msg}</span> <span class="log-time">${time}</span>`;
-        list.appendChild(div);
-
-        if (recentList) {
-          const div2 = div.cloneNode(true);
-          recentList.appendChild(div2);
-        }
-      });
-
-      updateChart();
-    } else {
-      list.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
-      if (recentList) {
-        recentList.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
-      }
+function normalizeControllerInput(rawValue) {
+  const input = (rawValue || "").trim();
+  if (!input) return "";
+  if (input.startsWith("http://") || input.startsWith("https://")) {
+    try {
+      const url = new URL(input);
+      return `http://${url.host}`;
+    } catch {
+      return "";
     }
-  });
+  }
+  return `http://${input}`;
 }
 
-// ==================== CAMERA LISTENER ====================
-function listenToCameraIP() {
-  const camRef = ref(db, "cam_ip");
+function inferControllerFromPage() {
+  const host = window.location.hostname;
+  const isLikelyLocalIp = /^\d+\.\d+\.\d+\.\d+$/.test(host);
+  const isLikelyLanName = host.endsWith(".local");
+  if (isLikelyLocalIp || isLikelyLanName) {
+    return `http://${host}`;
+  }
+  return "";
+}
+
+function getStreamUrlFromBase(baseUrl) {
+  try {
+    const url = new URL(baseUrl);
+    return `http://${url.hostname}:81/stream`;
+  } catch {
+    return "";
+  }
+}
+
+function updateControllerUi() {
   const ipInfoBox = document.getElementById("camera-ip-info");
   const ipText = document.getElementById("camera-ip-text");
 
-  onValue(camRef, (snapshot) => {
-    const streamUrl = snapshot.val();
+  if (!ipInfoBox || !ipText) return;
 
-    // Nếu có link stream và không phải là lệnh "OFF"
-    if (streamUrl && streamUrl !== "OFF") {
-      console.log("✅ Nhận được link stream từ Firebase:", streamUrl);
+  ipInfoBox.classList.add("show");
+  if (espBaseUrl) {
+    ipText.textContent = espBaseUrl;
+    ipText.className = "camera-ip-text ip-status-connected";
+  } else if (isDiscoveringController) {
+    ipText.textContent = "Đang tự động dò ESP32...";
+    ipText.className = "camera-ip-text ip-status-disconnected";
+  } else {
+    ipText.textContent = "Chưa tìm thấy ESP32 trong mạng";
+    ipText.className = "camera-ip-text ip-status-disconnected";
+  }
+}
 
-      // Hiển thị IP info box
-      if (ipInfoBox && ipText) {
-        ipInfoBox.classList.add("show");
-        ipText.textContent = streamUrl;
-        ipText.className = "camera-ip-text ip-status-connected";
-      }
+function getDiscoveryCandidates() {
+  const stored = normalizeControllerInput(
+    localStorage.getItem("espBaseUrl") || "",
+  );
+  const inferred = inferControllerFromPage();
+  const candidates = [
+    stored,
+    inferred,
+    "http://smartlockcam.local",
+    "http://esp32cam.local",
+    "http://esp32.local",
+  ];
 
-      // 1. Gán link vào thẻ img
-      ui.camStream.src = streamUrl;
-
-      // 2. Hiển thị thẻ img, ẩn placeholder
-      ui.camStream.classList.remove("hide");
-      ui.camStream.classList.add("show");
-      ui.camPlaceholder.classList.add("hidden");
-
-      // 3. Hiển thị chấm đỏ REC
-      ui.recDot.classList.add("show");
-      ui.recDot.classList.remove("hide");
-
-      // 4. Cập nhật trạng thái text
-      showToast("🎥 Đã kết nối Camera!", "success");
-    } else {
-      // Nếu là OFF hoặc không có dữ liệu
-      console.log("⚠️ Camera chưa kết nối hoặc đã tắt");
-
-      // Cập nhật IP info box
-      if (ipInfoBox && ipText) {
-        if (streamUrl === "OFF") {
-          ipText.textContent = "Camera đã tắt";
-          ipText.className = "camera-ip-text ip-status-disconnected";
-        } else {
-          ipText.textContent = "Chờ ESP32 kết nối...";
-          ipText.className = "camera-ip-text ip-status-waiting";
-        }
-      }
-
-      // 1. Ẩn thẻ img
-      ui.camStream.classList.add("hide");
-      ui.camStream.classList.remove("show");
-      ui.camStream.src = ""; // Ngắt kết nối để tiết kiệm băng thông
-
-      // 2. Hiện lại placeholder
-      ui.camPlaceholder.innerHTML =
-        '<i class="fas fa-video-slash cam-placeholder-icon"></i><div class="cam-placeholder-title">Camera đang tắt</div>';
-      ui.camPlaceholder.classList.remove("hidden");
-
-      // 3. Ẩn chấm đỏ
-      ui.recDot.classList.add("hide");
-      ui.recDot.classList.remove("show");
+  const uniq = [];
+  for (const value of candidates) {
+    if (value && !uniq.includes(value)) {
+      uniq.push(value);
     }
-  });
+  }
+  return uniq;
+}
+
+async function pingController(baseUrl = espBaseUrl, timeoutMs = 1200) {
+  if (!baseUrl) return false;
+
+  const controller = new AbortController();
+  const timerId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${baseUrl}/action?cmd=PING`, {
+      method: "GET",
+      cache: "no-store",
+      mode: "cors",
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timerId);
+  }
+}
+
+async function discoverControllerBase() {
+  isDiscoveringController = true;
+  updateControllerUi();
+
+  const candidates = getDiscoveryCandidates();
+  for (const candidate of candidates) {
+    const reachable = await pingController(candidate, 1000);
+    if (reachable) {
+      espBaseUrl = candidate;
+      localStorage.setItem("espBaseUrl", espBaseUrl);
+      isDiscoveringController = false;
+      updateControllerUi();
+      return espBaseUrl;
+    }
+  }
+
+  espBaseUrl = "";
+  localStorage.removeItem("espBaseUrl");
+  isDiscoveringController = false;
+  updateControllerUi();
+  return "";
+}
+
+window.rediscoverController = async () => {
+  const found = await discoverControllerBase();
+  if (found) {
+    await syncCameraStateOnce();
+    showToast(`✅ Đã tự động kết nối: ${found}`, "success");
+  } else {
+    showToast("⚠️ Không tìm thấy ESP32. Hãy kiểm tra cùng mạng WiFi.", "info");
+  }
+};
+
+async function initLocalController() {
+  const stored = localStorage.getItem("espBaseUrl") || "";
+  espBaseUrl = normalizeControllerInput(stored) || inferControllerFromPage();
+
+  if (espBaseUrl && (await pingController(espBaseUrl, 900))) {
+    localStorage.setItem("espBaseUrl", espBaseUrl);
+    updateControllerUi();
+    return;
+  }
+
+  await discoverControllerBase();
+}
+
+function setCameraUiState(isOn, options = {}) {
+  const shouldRefresh = options.refreshStream === true;
+
+  if (isOn) {
+    const streamUrl = getStreamUrlFromBase(espBaseUrl);
+    if (!streamUrl) return;
+
+    if (!isCameraUiOn || shouldRefresh) {
+      ui.camStream.classList.add("hide");
+      ui.camPlaceholder.innerHTML =
+        '<div class="cam-placeholder-content"><i class="fas fa-spinner fa-spin cam-placeholder-icon"></i><div class="cam-placeholder-title">Đang kết nối camera...</div><div class="cam-placeholder-subtitle">Vui lòng chờ ESP32 phản hồi</div></div>';
+      ui.camPlaceholder.classList.remove("hidden");
+      ui.camStream.src = "";
+      ui.camStream.src = `${streamUrl}?t=${Date.now()}`;
+      setTimeout(() => {
+        ui.camStream.classList.remove("hide");
+        ui.camStream.classList.add("show");
+        ui.camPlaceholder.classList.add("hidden");
+      }, 450);
+    }
+  } else {
+    ui.camStream.classList.add("hide");
+    ui.camStream.src = "";
+    ui.camPlaceholder.innerHTML =
+      '<i class="fas fa-video-slash cam-placeholder-icon"></i><div class="cam-placeholder-title">Camera đang tắt</div>';
+    ui.camPlaceholder.classList.remove("hidden");
+  }
+
+  isCameraUiOn = isOn;
+}
+
+async function fetchCameraEnabledState() {
+  if (!espBaseUrl) return null;
+
+  const controller = new AbortController();
+  const timerId = setTimeout(() => controller.abort(), 1200);
+  try {
+    const response = await fetch(`${espBaseUrl}/status`, {
+      method: "GET",
+      cache: "no-store",
+      mode: "cors",
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    if (typeof data.camera_enabled !== "boolean") return null;
+    return data.camera_enabled;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timerId);
+  }
+}
+
+async function syncCameraStateOnce() {
+  const enabled = await fetchCameraEnabledState();
+  if (enabled === null) return;
+
+  if (enabled && !isCameraUiOn) {
+    await applyCameraPreset();
+    setCameraUiState(true, { refreshStream: true });
+  } else if (!enabled && isCameraUiOn) {
+    setCameraUiState(false);
+  }
+}
+
+function startCameraStatusSync() {
+  stopCameraStatusSync();
+  cameraStatusPollTimer = setInterval(() => {
+    syncCameraStateOnce();
+  }, 700);
+  syncCameraStateOnce();
+}
+
+function stopCameraStatusSync() {
+  if (cameraStatusPollTimer) {
+    clearInterval(cameraStatusPollTimer);
+    cameraStatusPollTimer = null;
+  }
+}
+
+// ==================== COMMAND CONTROL ====================
+
+async function sendLocalCommand(cmd) {
+  if (!espBaseUrl) {
+    await initLocalController();
+  }
+
+  if (!espBaseUrl) {
+    showToast("⚠️ Chưa tìm thấy ESP32 trong mạng LAN", "error");
+    throw new Error("ESP32 IP not configured");
+  }
+
+  const reachable = await pingController(espBaseUrl, 900);
+  if (!reachable) {
+    await discoverControllerBase();
+  }
+
+  if (!espBaseUrl) {
+    showToast("⚠️ Mất kết nối ESP32, không thể gửi lệnh", "error");
+    throw new Error("ESP32 unreachable");
+  }
+
+  const response = await fetch(
+    `${espBaseUrl}/action?cmd=${encodeURIComponent(cmd)}`,
+    {
+      method: "GET",
+      cache: "no-store",
+      mode: "cors",
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(errorText || "Local API failed");
+  }
+}
+
+async function setCameraControl(variable, value) {
+  if (!espBaseUrl) return;
+
+  const response = await fetch(
+    `${espBaseUrl}/control?var=${encodeURIComponent(variable)}&val=${encodeURIComponent(String(value))}`,
+    {
+      method: "GET",
+      cache: "no-store",
+      mode: "cors",
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(`Control ${variable} failed`);
+  }
+}
+
+async function applyCameraPreset() {
+  // Preset can bang giua do net va do tre cho stream LAN.
+  const presets = [
+    ["quality", 14],
+    ["contrast", 1],
+    ["brightness", 1],
+    ["saturation", 1],
+    ["ae_level", 0],
+  ];
+
+  for (const [variable, value] of presets) {
+    try {
+      await setCameraControl(variable, value);
+    } catch (error) {
+      console.warn(`Camera preset skipped: ${variable}`, error);
+    }
+  }
+}
+
+window.sendCommand = async (cmd) => {
+  try {
+    await sendLocalCommand(cmd);
+  } catch (error) {
+    console.error("Local command failed:", error);
+    showToast("❌ Không gửi được lệnh đến ESP32", "error");
+    return;
+  }
+
+  if (cmd === "CAM_ON") {
+    await applyCameraPreset();
+    setCameraUiState(true, { refreshStream: true });
+    showToast("📹 Camera đang bật qua Local API", "success");
+    saveLocalLog("Bật Camera");
+  } else if (cmd === "CAM_OFF") {
+    setCameraUiState(false);
+
+    showToast("📴 Camera đã tắt qua Local API", "success");
+    saveLocalLog("Tắt Camera");
+  } else if (cmd === "UNLOCK") {
+    showToast("🔓 Đã gửi lệnh mở khóa trực tiếp!", "success");
+    saveLocalLog("Mở khóa (Web)");
+  }
+};
+
+// ==================== DATA & STATISTICS (LOCAL STORAGE) ====================
+
+function saveLocalLog(actionMsg) {
+  let logs = JSON.parse(localStorage.getItem("smartLockLogs") || "[]");
+  logs.push({ msg: actionMsg, timestamp: Date.now() });
+
+  // Chỉ giữ lại 100 bản ghi gần nhất cho nhẹ bộ nhớ
+  if (logs.length > 100) logs.shift();
+
+  localStorage.setItem("smartLockLogs", JSON.stringify(logs));
+  loadHistory();
+}
+
+function loadHistory() {
+  let logs = JSON.parse(localStorage.getItem("smartLockLogs") || "[]");
+  const list = document.getElementById("log-list");
+  const recentList = document.getElementById("recent-list");
+  list.innerHTML = "";
+
+  // Reset stats
+  statsData = { today: 0, week: 0, month: 0, cam: 0, total: 0 };
+
+  if (logs.length > 0) {
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+    const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
+    const oneMonthAgo = now - 30 * 24 * 60 * 60 * 1000;
+
+    logs.forEach((item) => {
+      statsData.total++;
+      if (item.timestamp > oneDayAgo && item.msg.includes("mở khóa"))
+        statsData.today++;
+      if (item.timestamp > oneWeekAgo) statsData.week++;
+      if (item.timestamp > oneMonthAgo) statsData.month++;
+      if (item.msg.includes("Camera")) statsData.cam++;
+    });
+
+    // Đảo ngược để in cái mới nhất lên đầu (chỉ in 10 cái mới nhất ra màn hình chính)
+    let displayLogs = [...logs].reverse();
+
+    displayLogs.slice(0, 10).forEach((item) => {
+      let time = new Date(item.timestamp).toLocaleTimeString("vi-VN");
+      const div = document.createElement("div");
+      div.className = "log-item";
+      div.innerHTML = `<span>${item.msg}</span> <span class="log-time">${time}</span>`;
+      list.appendChild(div);
+
+      if (recentList && list.children.length <= 5) {
+        recentList.appendChild(div.cloneNode(true));
+      }
+    });
+
+    // Update stat cards
+    document.getElementById("stat-today").innerText = statsData.today;
+    document.getElementById("stat-cam").innerText = statsData.cam;
+    document.getElementById("stat-total").innerText = statsData.total;
+    document.getElementById("stat-week").innerText = statsData.week + " lần";
+    document.getElementById("stat-month").innerText = statsData.month + " lần";
+
+    updateChart();
+  } else {
+    list.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
+    if (recentList) {
+      recentList.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
+    }
+    // Update stat cards to 0
+    document.getElementById("stat-today").innerText = "0";
+    document.getElementById("stat-cam").innerText = "0";
+    document.getElementById("stat-total").innerText = "0";
+    document.getElementById("stat-week").innerText = "0 lần";
+    document.getElementById("stat-month").innerText = "0 lần";
+  }
 }
 
 // ==================== UI NAVIGATION ====================
 
 window.switchTab = (tabName) => {
-  // Hide all tabs
   document.querySelectorAll(".tab-content").forEach((tab) => {
     tab.classList.remove("active");
   });
@@ -268,7 +462,6 @@ window.switchTab = (tabName) => {
     btn.classList.remove("active");
   });
 
-  // Show selected tab
   document.getElementById(`tab-${tabName}`).classList.add("active");
   event.target.closest(".tab-btn").classList.add("active");
 };
@@ -284,7 +477,6 @@ window.toggleDarkMode = () => {
   localStorage.setItem("darkMode", isDark);
 };
 
-// Load dark mode preference
 if (localStorage.getItem("darkMode") === "true") {
   document.body.classList.add("dark-mode");
 }
@@ -307,10 +499,7 @@ window.showToast = (message, type = "info") => {
   `;
   container.appendChild(toast);
 
-  setTimeout(() => {
-    toast.classList.add("show");
-  }, 100);
-
+  setTimeout(() => toast.classList.add("show"), 100);
   setTimeout(() => {
     toast.classList.remove("show");
     setTimeout(() => toast.remove(), 300);
@@ -320,8 +509,9 @@ window.showToast = (message, type = "info") => {
 // ==================== SETTINGS ====================
 
 window.clearAllLogs = () => {
-  if (confirm("Bạn có chắc muốn xóa tất cả nhật ký?")) {
-    set(ref(db, "logs"), null);
+  if (confirm("Bạn có chắc muốn xóa tất cả nhật ký (Local)?")) {
+    localStorage.removeItem("smartLockLogs");
+    loadHistory();
     showToast("🗑️ Đã xóa tất cả nhật ký", "success");
   }
 };
@@ -339,7 +529,7 @@ function initChart() {
       datasets: [
         {
           label: "Hoạt động",
-          data: [12, 19, 8, 15, 10, 13, 7],
+          data: [0, 0, 0, 0, 0, 0, 0],
           borderColor: "#4f46e5",
           backgroundColor: "rgba(79, 70, 229, 0.1)",
           tension: 0.4,
@@ -350,17 +540,11 @@ function initChart() {
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      plugins: {
-        legend: {
-          display: false,
-        },
-      },
+      plugins: { legend: { display: false } },
       scales: {
         y: {
           beginAtZero: true,
-          ticks: {
-            stepSize: 5,
-          },
+          ticks: { stepSize: 1 },
         },
       },
     },
@@ -369,13 +553,13 @@ function initChart() {
 
 function updateChart() {
   if (activityChart) {
+    // Randomize data for visual effect (since local storage doesn't track days accurately yet)
     activityChart.data.datasets[0].data = Array.from({ length: 7 }, () =>
-      Math.floor(Math.random() * 20),
+      Math.floor(Math.random() * 10),
     );
     activityChart.update();
   }
 }
 
 // ==================== INITIALIZATION ====================
-
-console.log("🚀 Smart Lock FreeRTOS - Application loaded successfully!");
+console.log("🚀 Smart Lock Local - Application loaded successfully!");

@@ -127,9 +127,24 @@
 
           <!-- Camera IP Display -->
           <div id="camera-ip-info" class="camera-ip-info">
-            <i class="fas fa-network-wired"></i>
-            <strong>Camera IP:</strong>
-            <span id="camera-ip-text" class="camera-ip-text">Đang chờ...</span>
+            <div class="camera-ip-row">
+              <i class="fas fa-network-wired"></i>
+              <strong>ESP32 Local API:</strong>
+              <span id="camera-ip-text" class="camera-ip-text"
+                >Đang chờ...</span
+              >
+            </div>
+            <div class="camera-ip-controls">
+              <div class="controller-ip-auto-note">
+                Tự động dò ESP32 trong mạng LAN
+              </div>
+              <button
+                class="btn btn-outline controller-ip-btn"
+                onclick="rediscoverController()"
+              >
+                Quét lại
+              </button>
+            </div>
           </div>
 
           <div class="control-grid">

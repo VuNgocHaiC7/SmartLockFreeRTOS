@@ -19,10 +19,15 @@
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
 #include "camera_index.h"
+#include <ctype.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
 #endif
+
+// Access global variable from main sketch
+extern volatile bool cameraEnabled;
+extern bool enqueueRemoteCommand(const char *cmd);
 
 // Face Detection will not work on boards without (or with disabled) PSRAM
 #ifdef BOARD_HAS_PSRAM
@@ -91,7 +96,7 @@ typedef struct
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %d.%06d\r\n\r\n";
+static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %ld.%06ld\r\n\r\n";
 
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
@@ -524,7 +529,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
     esp_err_t res = ESP_OK;
     size_t _jpg_buf_len = 0;
     uint8_t *_jpg_buf = NULL;
-    char *part_buf[128];
+    char part_buf[128];
 #if CONFIG_ESP_FACE_DETECT_ENABLED
     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
         bool detected = false;
@@ -568,6 +573,13 @@ static esp_err_t stream_handler(httpd_req_t *req)
 
     while (true)
     {
+        // Keep HTTP stream alive while camera is toggled off to avoid stale/frozen client sessions.
+        if (!cameraEnabled) {
+            vTaskDelay(60 / portTICK_PERIOD_MS);
+            last_frame = esp_timer_get_time();
+            continue;
+        }
+
 #if CONFIG_ESP_FACE_DETECT_ENABLED
     #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
         detected = false;
@@ -732,8 +744,13 @@ static esp_err_t stream_handler(httpd_req_t *req)
         }
         if (res == ESP_OK)
         {
-            size_t hlen = snprintf((char *)part_buf, 128, _STREAM_PART, _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
-            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+            int hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
+            if (hlen <= 0 || hlen >= (int)sizeof(part_buf)) {
+                log_e("Stream header formatting failed");
+                res = ESP_FAIL;
+            } else {
+                res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+            }
         }
         if (res == ESP_OK)
         {
@@ -814,6 +831,57 @@ static esp_err_t parse_get(httpd_req_t *req, char **obuf)
     }
     httpd_resp_send_404(req);
     return ESP_FAIL;
+}
+
+static esp_err_t action_handler(httpd_req_t *req)
+{
+    char *buf = NULL;
+    char cmd[16] = {0};
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    if (buf_len <= 1) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"missing query\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    buf = (char *)malloc(buf_len);
+    if (!buf || httpd_req_get_url_query_str(req, buf, buf_len) != ESP_OK) {
+        if (buf) {
+            free(buf);
+        }
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"query parse failed\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (httpd_query_key_value(buf, "cmd", cmd, sizeof(cmd)) != ESP_OK) {
+        free(buf);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"missing cmd\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    free(buf);
+
+    for (size_t i = 0; cmd[i] != '\0'; i++) {
+        cmd[i] = (char)toupper((unsigned char)cmd[i]);
+    }
+
+    if (!strcmp(cmd, "PING")) {
+        return httpd_resp_send(req, "{\"ok\":true,\"message\":\"pong\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (strcmp(cmd, "UNLOCK") && strcmp(cmd, "CAM_ON") && strcmp(cmd, "CAM_OFF")) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"unsupported cmd\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    if (!enqueueRemoteCommand(cmd)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"command queue busy\"}", HTTPD_RESP_USE_STRLEN);
+    }
+
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t cmd_handler(httpd_req_t *req)
@@ -1011,6 +1079,7 @@ static esp_err_t status_handler(httpd_req_t *req)
     p += sprintf(p, "\"face_recognize\":%u", recognition_enabled);
 #endif
 #endif
+    p += sprintf(p, ",\"camera_enabled\":%s", cameraEnabled ? "true" : "false");
     *p++ = '}';
     *p++ = 0;
     httpd_resp_set_type(req, "application/json");
@@ -1246,6 +1315,19 @@ void startCameraServer()
 #endif
     };
 
+    httpd_uri_t action_uri = {
+        .uri = "/action",
+        .method = HTTP_GET,
+        .handler = action_handler,
+        .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+        ,
+        .is_websocket = true,
+        .handle_ws_control_frames = false,
+        .supported_subprotocol = NULL
+#endif
+    };
+
     httpd_uri_t capture_uri = {
         .uri = "/capture",
         .method = HTTP_GET,
@@ -1362,6 +1444,7 @@ void startCameraServer()
     if (httpd_start(&camera_httpd, &config) == ESP_OK)
     {
         httpd_register_uri_handler(camera_httpd, &index_uri);
+        httpd_register_uri_handler(camera_httpd, &action_uri);
         httpd_register_uri_handler(camera_httpd, &cmd_uri);
         httpd_register_uri_handler(camera_httpd, &status_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
