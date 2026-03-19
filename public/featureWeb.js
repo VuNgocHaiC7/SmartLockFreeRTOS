@@ -14,7 +14,8 @@ const ui = {
 // Global Variables
 let activityChart = null;
 let statsData = { today: 0, week: 0, month: 0, cam: 0, total: 0 };
-let espBaseUrl = "";
+const FIXED_ESP_BASE_URL = "http://10.215.116.74";
+let espBaseUrl = FIXED_ESP_BASE_URL;
 let isDiscoveringController = false;
 let cameraStatusPollTimer = null;
 let isCameraUiOn = false;
@@ -74,12 +75,34 @@ function normalizeControllerInput(rawValue) {
 
 function inferControllerFromPage() {
   const host = window.location.hostname;
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1") {
+    return "";
+  }
   const isLikelyLocalIp = /^\d+\.\d+\.\d+\.\d+$/.test(host);
   const isLikelyLanName = host.endsWith(".local");
   if (isLikelyLocalIp || isLikelyLanName) {
     return `http://${host}`;
   }
   return "";
+}
+
+function expandControllerCandidates(baseUrl) {
+  try {
+    const parsed = new URL(baseUrl);
+    const withDefaultPort = `http://${parsed.hostname}`;
+    const withApiPort = `http://${parsed.hostname}:8080`;
+
+    // If caller already includes a custom port, keep it as highest priority.
+    if (parsed.port) {
+      return [baseUrl, withDefaultPort, withApiPort].filter(
+        (value, index, arr) => value && arr.indexOf(value) === index,
+      );
+    }
+
+    return [withDefaultPort, withApiPort];
+  } catch {
+    return [];
+  }
 }
 
 function getStreamUrlFromBase(baseUrl) {
@@ -111,25 +134,8 @@ function updateControllerUi() {
 }
 
 function getDiscoveryCandidates() {
-  const stored = normalizeControllerInput(
-    localStorage.getItem("espBaseUrl") || "",
-  );
-  const inferred = inferControllerFromPage();
-  const candidates = [
-    stored,
-    inferred,
-    "http://smartlockcam.local",
-    "http://esp32cam.local",
-    "http://esp32.local",
-  ];
-
-  const uniq = [];
-  for (const value of candidates) {
-    if (value && !uniq.includes(value)) {
-      uniq.push(value);
-    }
-  }
-  return uniq;
+  // Locked to one fixed ESP32 endpoint as requested.
+  return [FIXED_ESP_BASE_URL];
 }
 
 async function pingController(baseUrl = espBaseUrl, timeoutMs = 1200) {
@@ -158,6 +164,7 @@ async function discoverControllerBase() {
   updateControllerUi();
 
   const candidates = getDiscoveryCandidates();
+
   for (const candidate of candidates) {
     const reachable = await pingController(candidate, 1000);
     if (reachable) {
@@ -170,9 +177,41 @@ async function discoverControllerBase() {
   }
 
   espBaseUrl = "";
-  localStorage.removeItem("espBaseUrl");
+  localStorage.setItem("espBaseUrl", FIXED_ESP_BASE_URL);
   isDiscoveringController = false;
   updateControllerUi();
+  return "";
+}
+
+async function askUserForControllerBase() {
+  const suggested = localStorage.getItem("espBaseUrl") || "";
+  const input = window.prompt(
+    "Khong tim thay ESP32 tu dong. Nhap IP/host ESP32 (vd: 192.168.1.88 hoac 192.168.1.88:8080)",
+    suggested,
+  );
+
+  if (!input) {
+    return "";
+  }
+
+  const normalized = normalizeControllerInput(input);
+  if (!normalized) {
+    showToast("⚠️ Dia chi ESP32 khong hop le", "error");
+    return "";
+  }
+
+  const candidates = expandControllerCandidates(normalized);
+  for (const candidate of candidates) {
+    const reachable = await pingController(candidate, 1400);
+    if (reachable) {
+      espBaseUrl = candidate;
+      localStorage.setItem("espBaseUrl", espBaseUrl);
+      updateControllerUi();
+      return espBaseUrl;
+    }
+  }
+
+  showToast("⚠️ Khong ket noi duoc ESP32 voi dia chi vua nhap", "error");
   return "";
 }
 
@@ -180,23 +219,22 @@ window.rediscoverController = async () => {
   const found = await discoverControllerBase();
   if (found) {
     await syncCameraStateOnce();
-    showToast(`✅ Đã tự động kết nối: ${found}`, "success");
+    showToast(`✅ Da ket noi ESP32: ${found}`, "success");
   } else {
-    showToast("⚠️ Không tìm thấy ESP32. Hãy kiểm tra cùng mạng WiFi.", "info");
+    showToast("⚠️ Khong ket noi duoc ESP32 co dinh 10.215.116.74", "error");
   }
 };
 
 async function initLocalController() {
-  const stored = localStorage.getItem("espBaseUrl") || "";
-  espBaseUrl = normalizeControllerInput(stored) || inferControllerFromPage();
+  espBaseUrl = FIXED_ESP_BASE_URL;
+  localStorage.setItem("espBaseUrl", FIXED_ESP_BASE_URL);
+  updateControllerUi();
 
   if (espBaseUrl && (await pingController(espBaseUrl, 900))) {
-    localStorage.setItem("espBaseUrl", espBaseUrl);
-    updateControllerUi();
     return;
   }
 
-  await discoverControllerBase();
+  showToast("⚠️ ESP32 10.215.116.74 chua san sang", "info");
 }
 
 function setCameraUiState(isOn, options = {}) {
@@ -287,18 +325,16 @@ async function sendLocalCommand(cmd) {
     await initLocalController();
   }
 
+  espBaseUrl = FIXED_ESP_BASE_URL;
+
   if (!espBaseUrl) {
-    showToast("⚠️ Chưa tìm thấy ESP32 trong mạng LAN", "error");
+    showToast("⚠️ Chua cau hinh ESP32 co dinh", "error");
     throw new Error("ESP32 IP not configured");
   }
 
   const reachable = await pingController(espBaseUrl, 900);
   if (!reachable) {
-    await discoverControllerBase();
-  }
-
-  if (!espBaseUrl) {
-    showToast("⚠️ Mất kết nối ESP32, không thể gửi lệnh", "error");
+    showToast("⚠️ Mat ket noi ESP32 10.215.116.74", "error");
     throw new Error("ESP32 unreachable");
   }
 
