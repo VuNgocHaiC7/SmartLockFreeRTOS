@@ -5,10 +5,12 @@
 #include <LiquidCrystal_I2C.h>
 #include "I2CKeyPad.h" 
 #include <ESP32Servo.h>
-#include "soc/soc.h"             // Cần thiết cho Brownout
-#include "soc/rtc_cntl_reg.h"    // Cần thiết cho Brownout
-#include <WebServer.h>           // Thư viện cho Local API
+#include "soc/soc.h"             
+#include "soc/rtc_cntl_reg.h"    
+#include <WebServer.h>           
 #include <ESPmDNS.h>
+#include <HTTPClient.h> 
+#include <WiFiClientSecure.h> 
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h> 
@@ -19,9 +21,9 @@ extern void startCameraServer();
 
 #define NO_KEY '\0' 
 
-// ===========================
-// CẤU HÌNH PIN & ĐỊA CHỈ I2C
-// ===========================
+const char* BOT_TOKEN = "8232539691:AAFjxKp9UVyrpdwC03NzUR4DwNcSEnQsE10";
+const char* CHAT_ID = "7624836973";
+
 #define I2C_SDA 13
 #define I2C_SCL 15
 #define SERVO_PIN 14
@@ -32,11 +34,10 @@ extern void startCameraServer();
 LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
 I2CKeyPad keypad(KEYPAD_ADDR); 
 Servo myServo;
-WebServer apiServer(8080); // API Server chạy ở cổng 8080
+WebServer apiServer(8080); 
 
 SemaphoreHandle_t i2cMutex;
 
-// --- CÁC BIẾN QUẢN LÝ TRẠNG THÁI HỆ THỐNG ---
 enum SystemState {
   STATE_IDLE, 
   STATE_AUTH_OLD_PASS, 
@@ -56,9 +57,6 @@ unsigned long lockoutStartTime = 0;
 
 char keyMap[] = "123A456B789C*0#D"; 
 
-// ===========================
-// CẤU HÌNH FREE RTOS & EVENTS
-// ===========================
 enum EventSource { SRC_KEYPAD, SRC_LOCAL_API };
 struct SystemEvent {
   EventSource source;
@@ -67,16 +65,11 @@ struct SystemEvent {
 };
 
 QueueHandle_t eventQueue = NULL;
+QueueHandle_t telegramQueue = NULL;
 
-// ===========================
-// CẤU HÌNH WIFI
-// ===========================
 const char* ssid = "Q";
 const char* password = "1709200004";
 
-// ===========================
-// CẤU HÌNH CAMERA PIN
-// ===========================
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -96,7 +89,6 @@ const char* password = "1709200004";
 
 volatile bool cameraEnabled = false;
 
-// Khai báo hàm
 void displayDefault();
 void openDoor();
 void closeDoor();
@@ -105,7 +97,15 @@ void processKey(char key);
 void lcdPrint(const char* l1, const char* l2 = "");
 bool enqueueRemoteCommand(const char* cmd);
 
-// --- HÀM HELPER MUTEX LCD ---
+void sendTelegramAsync(const char* message) {
+  if (telegramQueue != NULL) {
+    char msgBuffer[128];
+    strncpy(msgBuffer, message, sizeof(msgBuffer) - 1);
+    msgBuffer[sizeof(msgBuffer) - 1] = '\0';
+    xQueueSend(telegramQueue, &msgBuffer, 0);
+  }
+}
+
 void lcdPrint(const char* l1, const char* l2) {
   if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
     lcd.clear(); 
@@ -147,6 +147,8 @@ void openDoor() {
   myServo.write(90); 
   isDoorOpen = true;
   doorOpenMillis = millis();
+
+  sendTelegramAsync("Mở cửa thành công!");
 }
 
 void closeDoor() {
@@ -157,7 +159,6 @@ void closeDoor() {
   displayDefault();
 }
 
-// --- HÀM XỬ LÝ LỆNH ---
 void processCommand(const char* cmdIn) {
   char cmd[16];
   strncpy(cmd, cmdIn, sizeof(cmd) - 1);
@@ -172,7 +173,7 @@ void processCommand(const char* cmdIn) {
   else if (strcmp(cmd, "CAM_ON") == 0 && !cameraEnabled) {
     lcdPrint("DANG BAT CAM...", "");
     cameraEnabled = true;
-    vTaskDelay(500 / portTICK_PERIOD_MS); // Chờ xíu cho người dùng đọc được chữ
+    vTaskDelay(500 / portTICK_PERIOD_MS); 
     displayDefault();
   } 
   else if (strcmp(cmd, "CAM_OFF") == 0 && cameraEnabled) {
@@ -193,7 +194,6 @@ bool enqueueRemoteCommand(const char* cmd) {
   return xQueueSend(eventQueue, &evt, 0) == pdTRUE;
 }
 
-// --- HÀM XỬ LÝ KEYPAD ---
 void processKey(char key) {
   Serial.print("Key Processed: "); Serial.println(key); 
 
@@ -226,6 +226,7 @@ void processKey(char key) {
           if (wrongPasswordCount >= 3) {
             lcdPrint("BAO DONG-DA KHOA", "Vui long doi 10s");
             currentState = STATE_LOCKED_OUT; lockoutStartTime = millis();
+            sendTelegramAsync("BÁO ĐỘNG: Nhập sai mật khẩu 3 lần!"); // Báo động Telegram
           } else {
             lcdPrint("SAI MAT KHAU!", ""); vTaskDelay(2000 / portTICK_PERIOD_MS);
             inputBuffer[0] = '\0'; displayDefault();
@@ -239,6 +240,7 @@ void processKey(char key) {
             if (wrongPasswordCount >= 3) {
                 lcdPrint("BAO DONG-DA KHOA", "Vui long doi 10s");
                 currentState = STATE_LOCKED_OUT; lockoutStartTime = millis();
+                sendTelegramAsync("BÁO ĐỘNG: Nhập sai pass cũ quá 3 lần!"); // Báo động Telegram
             } else {
                 lcdPrint("SAI PASS CU!", ""); vTaskDelay(2000 / portTICK_PERIOD_MS);
                 inputBuffer[0] = '\0'; currentState = STATE_IDLE; displayDefault(); 
@@ -259,6 +261,7 @@ void processKey(char key) {
           currentPassword[sizeof(currentPassword) - 1] = '\0'; 
           lcdPrint("DOI PASS OK!", ""); vTaskDelay(2000 / portTICK_PERIOD_MS);
           inputBuffer[0] = '\0'; currentState = STATE_IDLE; displayDefault();
+          sendTelegramAsync("Mật khẩu vừa được thay đổi!"); // Thông báo đổi pass
         } else {
           lcdPrint("PASS KO KHOP!", ""); vTaskDelay(2000 / portTICK_PERIOD_MS);
           inputBuffer[0] = '\0'; currentState = STATE_IDLE; displayDefault(); 
@@ -270,13 +273,10 @@ void processKey(char key) {
   }
 }
 
-// --- TASK: KEYPAD POLLING (Đã khắc phục lỗi Deadlock I2C) ---
 void keypadTask(void *pvParameters) {
   static char taskLastKey = '\0';
   while(1) {
     char keyToProcess = '\0';
-
-    // BƯỚC 1: Lấy Mutex, đọc phím thật nhanh rồi NHẢ MUTEX NGAY LẬP TỨC
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
        if (keypad.isPressed()) {
           char key = keypad.getChar(); 
@@ -284,28 +284,21 @@ void keypadTask(void *pvParameters) {
              keyToProcess = key;
           }
        }
-       xSemaphoreGive(i2cMutex); // Chìa khóa I2C đã được trả lại an toàn!
+       xSemaphoreGive(i2cMutex); 
     }
-
-    // BƯỚC 2: Xử lý sự kiện gửi Queue khi KHÔNG còn giữ Mutex
     if (keyToProcess != '\0') {
        if (keyToProcess != taskLastKey) {
-           SystemEvent evt;
-           evt.source = SRC_KEYPAD;
-           evt.key = keyToProcess;
-           evt.cmd[0] = '\0';
-           xQueueSend(eventQueue, &evt, 0); // Non-blocking send
+           SystemEvent evt; evt.source = SRC_KEYPAD; evt.key = keyToProcess; evt.cmd[0] = '\0';
+           xQueueSend(eventQueue, &evt, 0); 
            taskLastKey = keyToProcess;
        }
     } else {
        taskLastKey = '\0';
     }
-    
     vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
-// --- TASK: LOCAL API SERVER (Thay thế Firebase) ---
 void apiTask(void *pvParameters) {
   apiServer.on("/action", HTTP_GET, []() {
     apiServer.sendHeader("Access-Control-Allow-Origin", "*");
@@ -327,7 +320,35 @@ void apiTask(void *pvParameters) {
   }
 }
 
-// --- TASK LOGIC CHÍNH ---
+void telegramTask(void *pvParameters) {
+  char msgBuffer[128];
+  
+  while(1) {
+    if (xQueueReceive(telegramQueue, &msgBuffer, portMAX_DELAY) == pdTRUE) {
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("Đang gửi Telegram: ");
+        Serial.println(msgBuffer);
+
+        WiFiClientSecure client;
+        client.setInsecure(); 
+        HTTPClient http;
+
+        String url = "https://api.telegram.org/bot" + String(BOT_TOKEN) + "/sendMessage?chat_id=" + String(CHAT_ID) + "&text=" + String(msgBuffer);
+        
+        http.begin(client, url);
+        int httpCode = http.GET();
+        
+        if(httpCode > 0) {
+          Serial.printf("Telegram gửi OK. Code: %d\n", httpCode);
+        } else {
+          Serial.printf("Lỗi gửi Telegram: %s\n", http.errorToString(httpCode).c_str());
+        }
+        http.end();
+      }
+    }
+  }
+}
+
 void systemControlTask(void *pvParameters) {
   SystemEvent evt;
   while(1) {
@@ -356,7 +377,6 @@ void systemControlTask(void *pvParameters) {
   }
 }
 
-// --- MAIN SETUP ---
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
   Serial.begin(115200);
@@ -386,7 +406,6 @@ void setup() {
   config.grab_mode = CAMERA_GRAB_LATEST;
   
   if(psramFound()){
-    // PSRAM cho phep khung hinh lon hon va chat luong JPEG tot hon ma van giu duoc do tre thap.
     config.frame_size = FRAMESIZE_QVGA; 
     config.jpeg_quality = 20; 
     config.fb_count = 2; 
@@ -402,7 +421,6 @@ void setup() {
   else {
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-      // Preset uu tien stream net va on dinh cho xem local qua LAN.
       s->set_quality(s, 20);
       s->set_contrast(s, 1);
       s->set_brightness(s, 1);
@@ -429,10 +447,12 @@ void setup() {
   startCameraServer();
   
   eventQueue = xQueueCreate(10, sizeof(SystemEvent));
+  telegramQueue = xQueueCreate(5, 128);
   
   xTaskCreatePinnedToCore(keypadTask, "KeypadTask", 2048, NULL, 2, NULL, 1); 
   xTaskCreatePinnedToCore(systemControlTask, "ControlTask", 8192, NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(apiTask, "ApiTask", 4096, NULL, 1, NULL, 1); // Khởi động Local Web API
+  xTaskCreatePinnedToCore(apiTask, "ApiTask", 4096, NULL, 1, NULL, 1); 
+  xTaskCreatePinnedToCore(telegramTask, "TelegramTask", 6144, NULL, 1, NULL, 0); 
   
   displayDefault(); 
   vTaskDelete(NULL); 
