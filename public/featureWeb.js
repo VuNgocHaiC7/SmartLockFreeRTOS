@@ -14,11 +14,18 @@ const ui = {
 // Global Variables
 let activityChart = null;
 let statsData = { today: 0, week: 0, month: 0, cam: 0, total: 0 };
-const FIXED_ESP_BASE_URL = "http://10.215.116.74";
+let chartLabels = ["", "", "", "", "", "", ""];
+let chartCounts = [0, 0, 0, 0, 0, 0, 0];
+const FIXED_ESP_BASE_URL = "http://10.172.42.74";
 let espBaseUrl = FIXED_ESP_BASE_URL;
 let isDiscoveringController = false;
 let cameraStatusPollTimer = null;
+let historyPollTimer = null;
+let isHistorySyncing = false;
 let isCameraUiOn = false;
+let isFaceAuthRunning = false;
+let isFaceStorageLoading = false;
+let isAddingFace = false;
 
 // ==================== AUTHENTICATION (MOCK LOCAL) ====================
 
@@ -42,14 +49,17 @@ window.handleLogin = () => {
 
     await initLocalController();
     startCameraStatusSync();
+    startHistorySync();
     loadHistory();
     initChart();
-    showToast("✅ Đăng nhập mạng Local thành công!", "success");
+    loadFacesStorage();
+    showToast("Đăng nhập mạng Local thành công!", "success");
   }, 500);
 };
 
 window.handleLogout = () => {
   stopCameraStatusSync();
+  stopHistorySync();
   ui.loginScreen.classList.remove("hidden");
   ui.dashScreen.classList.add("hidden");
   ui.statusDot.classList.remove("online");
@@ -196,7 +206,7 @@ async function askUserForControllerBase() {
 
   const normalized = normalizeControllerInput(input);
   if (!normalized) {
-    showToast("⚠️ Dia chi ESP32 khong hop le", "error");
+    showToast("Dia chi ESP32 khong hop le", "error");
     return "";
   }
 
@@ -211,7 +221,7 @@ async function askUserForControllerBase() {
     }
   }
 
-  showToast("⚠️ Khong ket noi duoc ESP32 voi dia chi vua nhap", "error");
+  showToast("Khong ket noi duoc ESP32 voi dia chi vua nhap", "error");
   return "";
 }
 
@@ -219,9 +229,9 @@ window.rediscoverController = async () => {
   const found = await discoverControllerBase();
   if (found) {
     await syncCameraStateOnce();
-    showToast(`✅ Da ket noi ESP32: ${found}`, "success");
+    showToast(`Da ket noi ESP32: ${found}`, "success");
   } else {
-    showToast("⚠️ Khong ket noi duoc ESP32 co dinh 10.215.116.74", "error");
+    showToast("Khong ket noi duoc ESP32 co dinh 10.215.116.74", "error");
   }
 };
 
@@ -234,7 +244,7 @@ async function initLocalController() {
     return;
   }
 
-  showToast("⚠️ ESP32 10.215.116.74 chua san sang", "info");
+  showToast("ESP32 10.215.116.74 chua san sang", "info");
 }
 
 function setCameraUiState(isOn, options = {}) {
@@ -318,6 +328,31 @@ function stopCameraStatusSync() {
   }
 }
 
+async function syncHistoryOnce() {
+  if (isHistorySyncing) return;
+  isHistorySyncing = true;
+  try {
+    await loadHistory();
+  } finally {
+    isHistorySyncing = false;
+  }
+}
+
+function startHistorySync() {
+  stopHistorySync();
+  historyPollTimer = setInterval(() => {
+    syncHistoryOnce();
+  }, 2500);
+  syncHistoryOnce();
+}
+
+function stopHistorySync() {
+  if (historyPollTimer) {
+    clearInterval(historyPollTimer);
+    historyPollTimer = null;
+  }
+}
+
 // ==================== COMMAND CONTROL ====================
 
 async function sendLocalCommand(cmd) {
@@ -328,13 +363,13 @@ async function sendLocalCommand(cmd) {
   espBaseUrl = FIXED_ESP_BASE_URL;
 
   if (!espBaseUrl) {
-    showToast("⚠️ Chua cau hinh ESP32 co dinh", "error");
+    showToast("Chua cau hinh ESP32 co dinh", "error");
     throw new Error("ESP32 IP not configured");
   }
 
   const reachable = await pingController(espBaseUrl, 900);
   if (!reachable) {
-    showToast("⚠️ Mat ket noi ESP32 10.215.116.74", "error");
+    showToast("Mat ket noi ESP32 10.215.116.74", "error");
     throw new Error("ESP32 unreachable");
   }
 
@@ -389,12 +424,322 @@ async function applyCameraPreset() {
   }
 }
 
+function getControllerHost() {
+  if (!espBaseUrl) return "";
+  try {
+    return new URL(espBaseUrl).hostname;
+  } catch {
+    return "";
+  }
+}
+
+function getFaceApiCandidates(controllerHost) {
+  const query = controllerHost
+    ? `?ip=${encodeURIComponent(controllerHost)}`
+    : "";
+  return [
+    `/api/face-check${query}`,
+    `http://127.0.0.1:5000/api/face-check${query}`,
+    `http://localhost:5000/api/face-check${query}`,
+  ];
+}
+
+function getServerApiCandidates(pathWithQuery = "") {
+  return [
+    `${pathWithQuery}`,
+    `http://127.0.0.1:5000${pathWithQuery}`,
+    `http://localhost:5000${pathWithQuery}`,
+  ];
+}
+
+function getFacePhotoCandidates(name, photoUrl = "") {
+  const encodedName = encodeURIComponent(name);
+  const baseCandidates = getServerApiCandidates(`/api/face-photo/${encodedName}`);
+  const candidates = photoUrl ? [photoUrl, ...baseCandidates] : baseCandidates;
+  return candidates.filter((value, index, arr) => value && arr.indexOf(value) === index);
+}
+
+async function fetchWithFallback(pathWithQuery, options = {}) {
+  const candidates = getServerApiCandidates(pathWithQuery);
+  let response = null;
+  let lastError = null;
+
+  for (const endpoint of candidates) {
+    try {
+      response = await fetch(endpoint, options);
+      if (response.ok) {
+        return response;
+      }
+      const errorText = await response.text();
+      lastError = new Error(errorText || `API failed at ${endpoint}`);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error(`Cannot call API ${pathWithQuery}`);
+}
+
+function renderFacesStorage(faces = []) {
+  const list = document.getElementById("face-storage-list");
+  if (!list) return;
+
+  if (!Array.isArray(faces) || faces.length === 0) {
+    list.innerHTML = "<div class='no-data'>Chưa có khuôn mặt nào trong kho dữ liệu</div>";
+    return;
+  }
+
+  list.innerHTML = "";
+  faces
+    .sort((a, b) => (a.name || "").localeCompare(b.name || "", "vi"))
+    .forEach((face) => {
+      const safeName = String(face.name || "Unknown");
+      const photoCandidates = getFacePhotoCandidates(safeName, face.photo_url || "");
+      const photoSrc = photoCandidates[0] || "";
+      const fallbackSrc = photoCandidates.slice(1).join("||");
+      const item = document.createElement("div");
+      item.className = "face-storage-item";
+      item.innerHTML = `
+        <div class="face-storage-left">
+          <img
+            class="face-storage-thumb"
+            src="${photoSrc}"
+            alt="${safeName}"
+            loading="lazy"
+            data-fallback-src="${fallbackSrc}"
+          />
+          <div class="face-storage-meta">
+            <div class="face-storage-name">${safeName}</div>
+            <div class="face-storage-count">${face.image_count || 0} ảnh</div>
+          </div>
+        </div>
+        <button class="btn btn-danger face-delete-btn" data-face-name="${safeName}">
+          <i class="fas fa-trash"></i>
+          <span>Xóa</span>
+        </button>
+      `;
+      list.appendChild(item);
+    });
+
+  list.querySelectorAll(".face-delete-btn").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const name = button.getAttribute("data-face-name") || "";
+      if (!name) return;
+      await deleteFaceFromStorage(name);
+    });
+  });
+
+  list.querySelectorAll(".face-storage-thumb").forEach((imageEl) => {
+    imageEl.addEventListener("error", () => {
+      const fallbackRaw = imageEl.getAttribute("data-fallback-src") || "";
+      if (!fallbackRaw) {
+        imageEl.classList.add("is-missing");
+        return;
+      }
+
+      const options = fallbackRaw.split("||").filter(Boolean);
+      if (options.length === 0) {
+        imageEl.classList.add("is-missing");
+        return;
+      }
+
+      const nextSrc = options.shift();
+      imageEl.setAttribute("data-fallback-src", options.join("||"));
+      imageEl.src = nextSrc;
+    });
+  });
+}
+
+async function loadFacesStorage() {
+  if (isFaceStorageLoading) return;
+  isFaceStorageLoading = true;
+
+  const list = document.getElementById("face-storage-list");
+  if (list) {
+    list.innerHTML = "<div class='loading-text'>Đang tải danh sách khuôn mặt...</div>";
+  }
+
+  try {
+    const response = await fetchWithFallback("/api/faces", {
+      method: "GET",
+      cache: "no-store",
+    });
+    const payload = await response.json();
+    renderFacesStorage(payload.faces || []);
+  } catch (error) {
+    console.error("Load faces storage failed:", error);
+    if (list) {
+      list.innerHTML = "<div class='no-data'>Không tải được danh sách khuôn mặt</div>";
+    }
+  } finally {
+    isFaceStorageLoading = false;
+  }
+}
+
+async function deleteFaceFromStorage(name) {
+  const ok = window.confirm(`Bạn có chắc muốn xóa khuôn mặt '${name}'?`);
+  if (!ok) return;
+
+  try {
+    await fetchWithFallback(`/api/faces/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+      cache: "no-store",
+    });
+    showToast(`Đã xóa khuôn mặt ${name}`, "success");
+    saveLocalLog(`Xóa khuôn mặt: ${name}`);
+    await loadFacesStorage();
+  } catch (error) {
+    console.error("Delete face failed:", error);
+    showToast("Xóa khuôn mặt thất bại", "error");
+  }
+}
+
+async function addFaceToStorageByName(name) {
+  const controllerHost = getControllerHost();
+  const captureQuery = controllerHost
+    ? `/api/esp32/capture?ip=${encodeURIComponent(controllerHost)}`
+    : "/api/esp32/capture";
+
+  const captureResponse = await fetchWithFallback(captureQuery, {
+    method: "GET",
+    cache: "no-store",
+  });
+  const capturePayload = await captureResponse.json();
+
+  const imageUrl = capturePayload && capturePayload.url ? capturePayload.url : "";
+  if (!imageUrl) {
+    throw new Error("Capture image URL not found");
+  }
+
+  // Keep behavior consistent with keypad D: once capture is done, turn camera off.
+  try {
+    await sendLocalCommand("CAM_OFF");
+  } catch (error) {
+    console.warn("Cannot turn camera off after face capture:", error);
+  }
+  setCameraUiState(false);
+
+  await fetchWithFallback("/api/add-face", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name,
+      image_url: imageUrl,
+    }),
+  });
+}
+
+window.addFaceFromEsp32 = async () => {
+  if (isAddingFace) {
+    showToast("Hệ thống đang thêm khuôn mặt, vui lòng chờ", "info");
+    return;
+  }
+
+  if (!isCameraUiOn) {
+    showToast("Vui lòng bật camera trước khi thêm ảnh khuôn mặt", "info");
+    return;
+  }
+
+  const input = document.getElementById("face-name-input");
+  const name = (input?.value || "").trim();
+  if (!name) {
+    showToast("Vui lòng nhập tên trước khi thêm", "error");
+    return;
+  }
+
+  isAddingFace = true;
+  try {
+    showToast("Đang chụp ảnh và thêm khuôn mặt mới...", "info");
+    await addFaceToStorageByName(name);
+    showToast(`Thêm khuôn mặt ${name} thành công`, "success");
+    saveLocalLog(`Thêm khuôn mặt: ${name}`);
+    if (input) input.value = "";
+    await loadFacesStorage();
+  } catch (error) {
+    console.error("Add face failed:", error);
+    showToast("Thêm khuôn mặt thất bại", "error");
+  } finally {
+    isAddingFace = false;
+  }
+};
+
+window.refreshFacesStorage = async () => {
+  await loadFacesStorage();
+};
+
+async function runFaceAuthCheck() {
+  if (isFaceAuthRunning) {
+    showToast("Hệ thống đang kiểm tra khuôn mặt, vui lòng chờ", "info");
+    return;
+  }
+
+  if (!isCameraUiOn) {
+    showToast("Vui lòng bật camera trước khi bấm Face ID", "info");
+    return;
+  }
+
+  isFaceAuthRunning = true;
+  showToast("Đang thực hiện nhận diện khuôn mặt...", "info");
+
+  try {
+    const controllerHost = getControllerHost();
+    const capturePath = controllerHost
+      ? `/api/esp32-capture?ip=${encodeURIComponent(controllerHost)}`
+      : "/api/esp32-capture";
+
+    const captureResponse = await fetchWithFallback(capturePath, {
+      method: "GET",
+      cache: "no-store",
+    });
+    const frameBlob = await captureResponse.blob();
+
+    // Keep behavior consistent with keypad D: once capture is done, turn camera off.
+    try {
+      await sendLocalCommand("CAM_OFF");
+    } catch (error) {
+      console.warn("Cannot turn camera off after Face ID capture:", error);
+    }
+    setCameraUiState(false);
+
+    const unlockResponse = await fetchWithFallback(
+      "/api/face-unlock?source=web_manual&device_id=DOOR-01",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "image/jpeg",
+        },
+        body: frameBlob,
+      },
+    );
+
+    const result = await unlockResponse.json();
+    if (result.recognized) {
+      const matchedName = result.name || "unknown";
+      showToast(`Khuôn mặt trùng khớp với kho dữ liệu (${matchedName})`, "success");
+    } else {
+      showToast("Khuôn mặt không trùng khớp với kho dữ liệu", "error");
+    }
+
+    await loadHistory();
+  } catch (error) {
+    console.error("Face auth failed:", error);
+    showToast("Không thể kiểm tra khuôn mặt từ server", "error");
+  } finally {
+    isFaceAuthRunning = false;
+  }
+}
+
 window.sendCommand = async (cmd) => {
+  if (cmd === "FACE_AUTH") {
+    await runFaceAuthCheck();
+    return;
+  }
+
   try {
     await sendLocalCommand(cmd);
   } catch (error) {
     console.error("Local command failed:", error);
-    showToast("❌ Không gửi được lệnh đến ESP32", "error");
+    showToast("Không gửi được lệnh đến ESP32", "error");
     return;
   }
 
@@ -406,15 +751,288 @@ window.sendCommand = async (cmd) => {
   } else if (cmd === "CAM_OFF") {
     setCameraUiState(false);
 
-    showToast("📴 Camera đã tắt qua Local API", "success");
+    showToast("Camera đã tắt qua Local API", "success");
     saveLocalLog("Tắt Camera");
   } else if (cmd === "UNLOCK") {
-    showToast("🔓 Đã gửi lệnh mở khóa trực tiếp!", "success");
-    saveLocalLog("Mở khóa (Web)");
+    showToast("Đã gửi lệnh mở khóa trực tiếp!", "success");
+    await createAccessLog({
+      status: "granted",
+      recognized_name: "Manual Unlock",
+      confidence: 100,
+      photo_url: null,
+    });
+    await loadHistory();
   }
 };
 
-// ==================== DATA & STATISTICS (LOCAL STORAGE) ====================
+// ==================== DATA & STATISTICS ====================
+
+const HANOI_TIMEZONE = "Asia/Ho_Chi_Minh";
+
+function setTextById(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.innerText = value;
+}
+
+function toDateSafe(value) {
+  if (!value) return null;
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+
+  // Parse timestamp as Hanoi time for consistent display (GMT+7).
+  if (typeof value === "string") {
+    const raw = value.trim();
+    const normalized = raw.includes(" ") ? raw.replace(" ", "T") : raw;
+    const hasTimezone = /Z$|[+\-]\d{2}:\d{2}$/.test(normalized);
+    const isoValue = hasTimezone ? normalized : `${normalized}+07:00`;
+    const hanoiDate = new Date(isoValue);
+    if (!Number.isNaN(hanoiDate.getTime())) {
+      return hanoiDate;
+    }
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date;
+}
+
+function getHistoryTimeDisplay(rawTimestamp) {
+  const date = toDateSafe(rawTimestamp);
+  if (!date) return "--:--:--";
+  return new Intl.DateTimeFormat("vi-VN", {
+    timeZone: HANOI_TIMEZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function getHistoryDateDisplay(rawTimestamp) {
+  const date = toDateSafe(rawTimestamp);
+  if (!date) return "--/--/----";
+  return new Intl.DateTimeFormat("vi-VN", {
+    timeZone: HANOI_TIMEZONE,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(date);
+}
+
+function getHistoryDateValue(rawTimestamp) {
+  const date = toDateSafe(rawTimestamp);
+  return date ? date.getTime() : 0;
+}
+
+function getHanoiDateKey(rawTimestamp) {
+  const date = toDateSafe(rawTimestamp);
+  if (!date) return "";
+
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: HANOI_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+
+  if (!year || !month || !day) return "";
+  return `${year}-${month}-${day}`;
+}
+
+function buildActivityChartData(rawTimestamps = []) {
+  const bucketMap = new Map();
+  const today = new Date();
+
+  const buckets = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - (6 - index));
+
+    const key = getHanoiDateKey(date);
+    const label = new Intl.DateTimeFormat("vi-VN", {
+      timeZone: HANOI_TIMEZONE,
+      day: "2-digit",
+      month: "2-digit",
+    }).format(date);
+
+    bucketMap.set(key, 0);
+    return { key, label };
+  });
+
+  rawTimestamps.forEach((rawTimestamp) => {
+    const key = getHanoiDateKey(rawTimestamp);
+    if (!key || !bucketMap.has(key)) return;
+    bucketMap.set(key, (bucketMap.get(key) || 0) + 1);
+  });
+
+  chartLabels = buckets.map((bucket) => bucket.label);
+  chartCounts = buckets.map((bucket) => bucketMap.get(bucket.key) || 0);
+}
+
+function mapServerLogToHistoryItem(log) {
+  const status = String(log.status || "unknown").toLowerCase();
+  const source = String(log.source || "unknown").toLowerCase();
+  const name = String(log.recognized_name || "").trim();
+  const confidence = Number(log.confidence || 0);
+  const hasName = name && name.toLowerCase() !== "unknown";
+
+  let title = "Hoạt động hệ thống";
+  if (source === "web_manual" && name === "Manual Unlock") {
+    title = "Mở khóa thủ công";
+  } else if (status === "granted" && hasName) {
+    title = `Face ID thành công (${name})`;
+  } else if (status === "denied") {
+    title = hasName ? `Face ID từ chối (${name})` : "Face ID không khớp";
+  } else if (status === "granted") {
+    title = "Mở khóa thành công";
+  }
+
+  const subtitleParts = [];
+  if (hasName && name !== "Manual Unlock") {
+    subtitleParts.push(`Tên: ${name}`);
+  }
+  if (confidence > 0 && name !== "Manual Unlock") {
+    subtitleParts.push(`Độ tin cậy: ${confidence}%`);
+  }
+
+  return {
+    title,
+    subtitle: subtitleParts.join(" • "),
+    timestamp: log.timestamp,
+    timeText: getHistoryTimeDisplay(log.timestamp),
+    dateText: getHistoryDateDisplay(log.timestamp),
+    dateValue: getHistoryDateValue(log.timestamp),
+    status,
+    photoUrl: log.photo_url || "",
+    source,
+  };
+}
+
+function isRelevantServerHistoryItem(item) {
+  if (!item) return false;
+
+  const title = String(item.title || "").toLowerCase();
+  const source = String(item.source || "").toLowerCase();
+
+  const isUnlockEvent = title.includes("mở khóa") || title.includes("mo khoa");
+  const isFaceEvent = title.includes("face") || source === "esp32_auto" || source === "lm393_auto";
+
+  return isUnlockEvent || isFaceEvent;
+}
+
+function createHistoryNode(item) {
+  const div = document.createElement("div");
+  div.className = `log-item activity-item ${item.status === "denied" ? "is-denied" : "is-granted"}`;
+
+  const photoHtml = item.photoUrl
+    ? `<img class="activity-photo" src="${item.photoUrl}" alt="activity" loading="lazy" />`
+    : '<div class="activity-photo-placeholder"><i class="fas fa-user"></i></div>';
+
+  const subtitleHtml = item.subtitle
+    ? `<div class="activity-subtitle">${item.subtitle}</div>`
+    : "";
+
+  div.innerHTML = `
+    <div class="activity-main">
+      ${photoHtml}
+      <div class="activity-text">
+        <div class="activity-title">${item.title}</div>
+        ${subtitleHtml}
+      </div>
+    </div>
+    <div class="log-datetime">
+      <span class="log-time">${item.timeText}</span>
+      <span class="log-date">${item.dateText || ""}</span>
+    </div>
+  `;
+
+  return div;
+}
+
+function renderHistoryFromServer(logs = []) {
+  const list = document.getElementById("log-list");
+  const recentList = document.getElementById("recent-list");
+  if (!list) return;
+
+  list.innerHTML = "";
+  if (recentList) recentList.innerHTML = "";
+
+  statsData = { today: 0, week: 0, month: 0, cam: 0, total: 0 };
+
+  const mapped = Array.isArray(logs)
+    ? logs
+        .map(mapServerLogToHistoryItem)
+        .filter(isRelevantServerHistoryItem)
+        .sort((a, b) => b.dateValue - a.dateValue)
+    : [];
+
+  buildActivityChartData(mapped.map((item) => item.timestamp));
+
+  if (mapped.length === 0) {
+    list.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
+    if (recentList) {
+      recentList.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
+    }
+    setTextById("stat-today", "0");
+    setTextById("stat-cam", "0");
+    setTextById("stat-total", "0");
+    setTextById("stat-week", "0 lần");
+    setTextById("stat-month", "0 lần");
+    updateChart();
+    return;
+  }
+
+  const now = Date.now();
+  const oneDayAgo = now - 24 * 60 * 60 * 1000;
+  const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
+  const oneMonthAgo = now - 30 * 24 * 60 * 60 * 1000;
+
+  mapped.forEach((item, index) => {
+    statsData.total++;
+    if (item.status === "granted" && item.dateValue > oneDayAgo) statsData.today++;
+    if (item.dateValue > oneWeekAgo) statsData.week++;
+    if (item.dateValue > oneMonthAgo) statsData.month++;
+    if (item.source.includes("camera")) statsData.cam++;
+
+    if (index < 12) {
+      list.appendChild(createHistoryNode(item));
+    }
+
+    if (recentList && index < 8) {
+      recentList.appendChild(createHistoryNode(item));
+    }
+  });
+
+  setTextById("stat-today", statsData.today);
+  setTextById("stat-cam", statsData.cam);
+  setTextById("stat-total", statsData.total);
+  setTextById("stat-week", `${statsData.week} lần`);
+  setTextById("stat-month", `${statsData.month} lần`);
+  updateChart();
+}
+
+async function createAccessLog(payload) {
+  try {
+    await fetchWithFallback("/api/access-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        device_id: "DOOR-01",
+        status: payload.status || "unknown",
+        photo_url: payload.photo_url || null,
+        recognized_name: payload.recognized_name || null,
+        confidence: payload.confidence || 0,
+      }),
+    });
+  } catch (error) {
+    console.warn("createAccessLog failed", error);
+  }
+}
 
 function saveLocalLog(actionMsg) {
   let logs = JSON.parse(localStorage.getItem("smartLockLogs") || "[]");
@@ -424,67 +1042,105 @@ function saveLocalLog(actionMsg) {
   if (logs.length > 100) logs.shift();
 
   localStorage.setItem("smartLockLogs", JSON.stringify(logs));
-  loadHistory();
 }
 
-function loadHistory() {
-  let logs = JSON.parse(localStorage.getItem("smartLockLogs") || "[]");
+function renderHistoryFromLocalStorage() {
+  const logs = JSON.parse(localStorage.getItem("smartLockLogs") || "[]");
   const list = document.getElementById("log-list");
   const recentList = document.getElementById("recent-list");
-  list.innerHTML = "";
 
-  // Reset stats
+  if (!list) return;
+  list.innerHTML = "";
+  if (recentList) recentList.innerHTML = "";
+
   statsData = { today: 0, week: 0, month: 0, cam: 0, total: 0 };
 
-  if (logs.length > 0) {
+  const filteredLogs = logs.filter((item) => {
+    const msg = String(item.msg || "").toLowerCase();
+    return msg.includes("face") || msg.includes("mở khóa") || msg.includes("mo khoa");
+  });
+
+  buildActivityChartData(filteredLogs.map((item) => item.timestamp));
+
+  if (filteredLogs.length > 0) {
     const now = Date.now();
     const oneDayAgo = now - 24 * 60 * 60 * 1000;
     const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
     const oneMonthAgo = now - 30 * 24 * 60 * 60 * 1000;
 
-    logs.forEach((item) => {
+    filteredLogs.forEach((item) => {
       statsData.total++;
-      if (item.timestamp > oneDayAgo && item.msg.includes("mở khóa"))
+      if (item.timestamp > oneDayAgo && item.msg.toLowerCase().includes("mở khóa")) {
         statsData.today++;
+      }
       if (item.timestamp > oneWeekAgo) statsData.week++;
       if (item.timestamp > oneMonthAgo) statsData.month++;
-      if (item.msg.includes("Camera")) statsData.cam++;
+      statsData.cam = 0;
     });
 
-    // Đảo ngược để in cái mới nhất lên đầu (chỉ in 10 cái mới nhất ra màn hình chính)
-    let displayLogs = [...logs].reverse();
+    let displayLogs = [...filteredLogs].reverse();
 
     displayLogs.slice(0, 10).forEach((item) => {
-      let time = new Date(item.timestamp).toLocaleTimeString("vi-VN");
+      const time = new Intl.DateTimeFormat("vi-VN", {
+        timeZone: HANOI_TIMEZONE,
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }).format(new Date(item.timestamp));
+      const date = new Intl.DateTimeFormat("vi-VN", {
+        timeZone: HANOI_TIMEZONE,
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+      }).format(new Date(item.timestamp));
       const div = document.createElement("div");
       div.className = "log-item";
-      div.innerHTML = `<span>${item.msg}</span> <span class="log-time">${time}</span>`;
+      div.innerHTML = `
+        <span>${item.msg}</span>
+        <div class="log-datetime">
+          <span class="log-time">${time}</span>
+          <span class="log-date">${date}</span>
+        </div>
+      `;
       list.appendChild(div);
 
-      if (recentList && list.children.length <= 5) {
+      if (recentList && recentList.children.length < 5) {
         recentList.appendChild(div.cloneNode(true));
       }
     });
 
-    // Update stat cards
-    document.getElementById("stat-today").innerText = statsData.today;
-    document.getElementById("stat-cam").innerText = statsData.cam;
-    document.getElementById("stat-total").innerText = statsData.total;
-    document.getElementById("stat-week").innerText = statsData.week + " lần";
-    document.getElementById("stat-month").innerText = statsData.month + " lần";
-
+    setTextById("stat-today", statsData.today);
+    setTextById("stat-cam", statsData.cam);
+    setTextById("stat-total", statsData.total);
+    setTextById("stat-week", statsData.week + " lần");
+    setTextById("stat-month", statsData.month + " lần");
     updateChart();
   } else {
     list.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
     if (recentList) {
       recentList.innerHTML = "<div class='no-data'>Chưa có dữ liệu</div>";
     }
-    // Update stat cards to 0
-    document.getElementById("stat-today").innerText = "0";
-    document.getElementById("stat-cam").innerText = "0";
-    document.getElementById("stat-total").innerText = "0";
-    document.getElementById("stat-week").innerText = "0 lần";
-    document.getElementById("stat-month").innerText = "0 lần";
+    setTextById("stat-today", "0");
+    setTextById("stat-cam", "0");
+    setTextById("stat-total", "0");
+    setTextById("stat-week", "0 lần");
+    setTextById("stat-month", "0 lần");
+    updateChart();
+  }
+}
+
+async function loadHistory() {
+  try {
+    const response = await fetchWithFallback("/api/logs?limit=120", {
+      method: "GET",
+      cache: "no-store",
+    });
+    const payload = await response.json();
+    renderHistoryFromServer(payload.data || []);
+  } catch (error) {
+    console.warn("Load history from server failed, fallback local", error);
+    renderHistoryFromLocalStorage();
   }
 }
 
@@ -500,6 +1156,10 @@ window.switchTab = (tabName) => {
 
   document.getElementById(`tab-${tabName}`).classList.add("active");
   event.target.closest(".tab-btn").classList.add("active");
+
+  if (tabName === "settings") {
+    loadFacesStorage();
+  }
 };
 
 // ==================== DARK MODE ====================
@@ -509,7 +1169,7 @@ window.toggleDarkMode = () => {
   const isDark = document.body.classList.contains("dark-mode");
   const icon = event.target.closest("button").querySelector("i");
   icon.className = isDark ? "fas fa-sun" : "fas fa-moon";
-  showToast(isDark ? "🌙 Đã bật chế độ tối" : "☀️ Đã tắt chế độ tối", "info");
+  showToast(isDark ? "Đã bật chế độ tối" : "Đã tắt chế độ tối", "info");
   localStorage.setItem("darkMode", isDark);
 };
 
@@ -545,11 +1205,26 @@ window.showToast = (message, type = "info") => {
 // ==================== SETTINGS ====================
 
 window.clearAllLogs = () => {
-  if (confirm("Bạn có chắc muốn xóa tất cả nhật ký (Local)?")) {
-    localStorage.removeItem("smartLockLogs");
-    loadHistory();
-    showToast("🗑️ Đã xóa tất cả nhật ký", "success");
+  if (!confirm("Bạn có chắc muốn xóa tất cả nhật ký hoạt động?")) {
+    return;
   }
+
+  (async () => {
+    localStorage.removeItem("smartLockLogs");
+
+    try {
+      await fetchWithFallback("/api/logs", {
+        method: "DELETE",
+        cache: "no-store",
+      });
+      showToast("Đã xóa toàn bộ nhật ký hoạt động", "success");
+    } catch (error) {
+      console.warn("Clear server logs failed:", error);
+      showToast("Đã xóa local, nhưng không xóa được nhật ký server", "error");
+    }
+
+    await loadHistory();
+  })();
 };
 
 // ==================== CHART ====================
@@ -561,11 +1236,11 @@ function initChart() {
   activityChart = new Chart(ctx, {
     type: "line",
     data: {
-      labels: ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "CN"],
+      labels: chartLabels,
       datasets: [
         {
           label: "Hoạt động",
-          data: [0, 0, 0, 0, 0, 0, 0],
+          data: chartCounts,
           borderColor: "#4f46e5",
           backgroundColor: "rgba(79, 70, 229, 0.1)",
           tension: 0.4,
@@ -585,17 +1260,17 @@ function initChart() {
       },
     },
   });
+
+  updateChart();
 }
 
 function updateChart() {
   if (activityChart) {
-    // Randomize data for visual effect (since local storage doesn't track days accurately yet)
-    activityChart.data.datasets[0].data = Array.from({ length: 7 }, () =>
-      Math.floor(Math.random() * 10),
-    );
+    activityChart.data.labels = chartLabels;
+    activityChart.data.datasets[0].data = chartCounts;
     activityChart.update();
   }
 }
 
 // ==================== INITIALIZATION ====================
-console.log("🚀 Smart Lock Local - Application loaded successfully!");
+console.log("Smart Lock Local - Application loaded successfully!");
