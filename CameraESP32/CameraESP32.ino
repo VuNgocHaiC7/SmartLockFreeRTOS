@@ -66,9 +66,11 @@ struct SystemEvent {
 
 QueueHandle_t eventQueue = NULL;
 QueueHandle_t telegramQueue = NULL;
+SemaphoreHandle_t faceAuthSemaphore = NULL;
 
 const char* ssid = "Q";
 const char* password = "1709200004";
+const char* FACE_UNLOCK_URL = "http://10.172.42.224:5000/api/face-unlock?source=keypad_d&device_id=DOOR-01";
 
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -96,6 +98,17 @@ void processCommand(const char* cmd);
 void processKey(char key);
 void lcdPrint(const char* l1, const char* l2 = "");
 bool enqueueRemoteCommand(const char* cmd);
+void runFaceAuth();
+void beepTwice();
+
+void beepTwice() {
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    vTaskDelay(120 / portTICK_PERIOD_MS);
+    digitalWrite(BUZZER_PIN, LOW);
+    vTaskDelay(120 / portTICK_PERIOD_MS);
+  }
+}
 
 void sendTelegramAsync(const char* message) {
   if (telegramQueue != NULL) {
@@ -144,19 +157,139 @@ void openDoor() {
   digitalWrite(BUZZER_PIN, LOW);
 
   lcdPrint("DUNG MAT KHAU!", "DANG MO CUA...");
-  myServo.write(90); 
+  myServo.write(70);
+  vTaskDelay(900 / portTICK_PERIOD_MS);
   isDoorOpen = true;
   doorOpenMillis = millis();
 
-  sendTelegramAsync("Mở cửa thành công!");
 }
 
 void closeDoor() {
   Serial.println("Cửa đóng!");
-  myServo.write(0); 
+  myServo.write(0);
+  vTaskDelay(900 / portTICK_PERIOD_MS);
   isDoorOpen = false;
   inputBuffer[0] = '\0'; 
   displayDefault();
+}
+
+void runFaceAuth() {
+  // For keypad D flow: capture once, then keep camera OFF until user turns it on again.
+  if (!cameraEnabled) {
+    beepTwice();
+    lcdPrint("VUI LONG BAT CAM", "ROI THU LAI D");
+    vTaskDelay(1200 / portTICK_PERIOD_MS);
+    displayDefault();
+    return;
+  }
+
+  cameraEnabled = false;
+  vTaskDelay(120 / portTICK_PERIOD_MS);
+
+  if (WiFi.status() != WL_CONNECTED) {
+    beepTwice();
+    lcdPrint("MAT WIFI", "THU LAI SAU");
+    vTaskDelay(1200 / portTICK_PERIOD_MS);
+    displayDefault();
+    return;
+  }
+
+  lcdPrint("DANG NHAN DIEN", "VUI LONG DOI...");
+
+  // Warm-up frames de giam anh cu/anh mo truoc khi gui len server.
+  for (int i = 0; i < 2; i++) {
+    camera_fb_t *warmup = esp_camera_fb_get();
+    if (warmup) {
+      esp_camera_fb_return(warmup);
+    }
+    vTaskDelay(40 / portTICK_PERIOD_MS);
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb || fb->len == 0) {
+    if (fb) {
+      esp_camera_fb_return(fb);
+    }
+    beepTwice();
+    lcdPrint("LOI CHUP ANH CAM", "THU LAI SAU");
+    vTaskDelay(1500 / portTICK_PERIOD_MS);
+    displayDefault();
+    return;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+
+  http.setReuse(false);
+  http.setConnectTimeout(2500);
+  http.setTimeout(8000);
+
+  http.begin(client, FACE_UNLOCK_URL);
+  http.addHeader("Content-Type", "image/jpeg");
+  int httpCode = http.POST(fb->buf, fb->len);
+  String responseBody;
+  if (httpCode > 0) {
+    responseBody = http.getString();
+  }
+  http.end();
+  esp_camera_fb_return(fb);
+
+  if (httpCode <= 0) {
+    Serial.printf("Face auth HTTP error: %s\n", http.errorToString(httpCode).c_str());
+    beepTwice();
+    lcdPrint("LOI KET NOI API", "THU LAI SAU");
+    vTaskDelay(1500 / portTICK_PERIOD_MS);
+    displayDefault();
+    return;
+  }
+
+  if (httpCode < 200 || httpCode >= 300) {
+    Serial.printf("Face auth HTTP status: %d\n", httpCode);
+    Serial.println(responseBody);
+    beepTwice();
+    lcdPrint("LOI NHAN DIEN", "MA PHAN HOI API");
+    vTaskDelay(1500 / portTICK_PERIOD_MS);
+    displayDefault();
+    return;
+  }
+
+  bool recognized = responseBody.indexOf("\"recognized\":true") >= 0;
+  if (recognized) {
+    String matchedName = "unknown";
+    int namePos = responseBody.indexOf("\"name\":\"");
+    if (namePos >= 0) {
+      int start = namePos + 8;
+      int end = responseBody.indexOf("\"", start);
+      if (end > start) {
+        matchedName = responseBody.substring(start, end);
+      }
+    }
+
+    String okMsg = "Nhận diện mặt thành công: " + matchedName;
+    sendTelegramAsync(okMsg.c_str());
+    lcdPrint("MAT HOP LE", "DANG MO CUA");
+    openDoor();
+    vTaskDelay(1500 / portTICK_PERIOD_MS); 
+    displayDefault();
+    return;
+  }
+
+  String denyMsg = "Nhận diện mặt thất bại";
+  sendTelegramAsync(denyMsg.c_str());
+  beepTwice();
+  lcdPrint("TU CHOI TRUY CAP", "KHONG NHAN DIEN");
+  vTaskDelay(1400 / portTICK_PERIOD_MS);
+  displayDefault();
+}
+
+void faceAuthTask(void *pvParameters) {
+  while(1) {
+    // Chờ tín hiệu từ nút bấm (chờ vô tận không tốn CPU)
+    if (xSemaphoreTake(faceAuthSemaphore, portMAX_DELAY) == pdTRUE) {
+       // Khi nhận được tín hiệu, mới bắt đầu chạy hàm nhận diện
+       runFaceAuth(); 
+    }
+  }
 }
 
 void processCommand(const char* cmdIn) {
@@ -168,6 +301,7 @@ void processCommand(const char* cmdIn) {
 
   if (strcmp(cmd, "UNLOCK") == 0) {
     if (currentState == STATE_LOCKED_OUT) return;
+    sendTelegramAsync("Mở cửa trên web");
     openDoor();
   }
   else if (strcmp(cmd, "CAM_ON") == 0 && !cameraEnabled) {
@@ -203,10 +337,10 @@ void processKey(char key) {
           vTaskDelay(1000 / portTICK_PERIOD_MS); displayDefault(); return;
       }
   } else {
-      if (key == 'D') {
-          lcdPrint("VUI LONG BAT CAM!", ""); 
-          vTaskDelay(1000 / portTICK_PERIOD_MS); displayDefault(); return;
-      }
+    if (key == 'D') {
+      lcdPrint("VUI LONG BAT CAM!", "");
+      vTaskDelay(1000 / portTICK_PERIOD_MS); displayDefault(); return;
+    }
   }
 
   if (key == '*') { 
@@ -215,18 +349,24 @@ void processKey(char key) {
   else if (key == 'A') { currentState = STATE_AUTH_OLD_PASS; inputBuffer[0] = '\0'; displayDefault(); } 
   else if (key == 'B') processCommand("CAM_ON");
   else if (key == 'C') processCommand("CAM_OFF");
-  else if (key == 'D') { lcdPrint("Face ID: TODO", ""); vTaskDelay(1000 / portTICK_PERIOD_MS); displayDefault(); } 
+  else if (key == 'D') {
+      lcdPrint("DANG XU LY...", ""); 
+      xSemaphoreGive(faceAuthSemaphore); 
+  }
   else if (key == '#') { 
     switch(currentState) {
       case STATE_IDLE: 
         if (strcmp(inputBuffer, currentPassword) == 0) {
-          wrongPasswordCount = 0; openDoor();
+          wrongPasswordCount = 0;
+          sendTelegramAsync("Mở cửa bằng mật khẩu");
+          openDoor();
         } else {
+          beepTwice();
           wrongPasswordCount++;
           if (wrongPasswordCount >= 3) {
             lcdPrint("BAO DONG-DA KHOA", "Vui long doi 10s");
             currentState = STATE_LOCKED_OUT; lockoutStartTime = millis();
-            sendTelegramAsync("BÁO ĐỘNG: Nhập sai mật khẩu 3 lần!"); // Báo động Telegram
+            sendTelegramAsync("Báo động: Nhập sai mật khẩu 3 lần!");
           } else {
             lcdPrint("SAI MAT KHAU!", ""); vTaskDelay(2000 / portTICK_PERIOD_MS);
             inputBuffer[0] = '\0'; displayDefault();
@@ -236,11 +376,12 @@ void processKey(char key) {
         if (strcmp(inputBuffer, currentPassword) == 0) {
             wrongPasswordCount = 0; currentState = STATE_ENTER_NEW_PASS; inputBuffer[0] = '\0'; displayDefault();
         } else {
+          beepTwice();
             wrongPasswordCount++;
             if (wrongPasswordCount >= 3) {
-                lcdPrint("BAO DONG-DA KHOA", "Vui long doi 10s");
+                lcdPrint("Bao Dong-Da Khoa", "Vui long doi 10s");
                 currentState = STATE_LOCKED_OUT; lockoutStartTime = millis();
-                sendTelegramAsync("BÁO ĐỘNG: Nhập sai pass cũ quá 3 lần!"); // Báo động Telegram
+                sendTelegramAsync("Báo động: Nhập sai pass cũ quá 3 lần!");
             } else {
                 lcdPrint("SAI PASS CU!", ""); vTaskDelay(2000 / portTICK_PERIOD_MS);
                 inputBuffer[0] = '\0'; currentState = STATE_IDLE; displayDefault(); 
@@ -316,7 +457,7 @@ void apiTask(void *pvParameters) {
 
   while(1) {
     apiServer.handleClient();
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+    vTaskDelay(30 / portTICK_PERIOD_MS);
   }
 }
 
@@ -373,7 +514,7 @@ void systemControlTask(void *pvParameters) {
       }
 
       if (isDoorOpen && (millis() - doorOpenMillis > 5000)) closeDoor();
-      vTaskDelay(10 / portTICK_PERIOD_MS);
+      vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
@@ -393,8 +534,6 @@ void setup() {
   if (keypad.begin()) { Serial.println("Keypad found!"); keypad.loadKeyMap(keyMap); } 
   else { Serial.println("Keypad NOT found!"); lcd.setCursor(0,1); lcd.print("Err: Keypad"); delay(2000); }
   
-  myServo.attach(SERVO_PIN); myServo.write(0); 
-
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0; config.ledc_timer = LEDC_TIMER_0;
   config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM; config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
@@ -406,13 +545,13 @@ void setup() {
   config.grab_mode = CAMERA_GRAB_LATEST;
   
   if(psramFound()){
-    config.frame_size = FRAMESIZE_QVGA; 
-    config.jpeg_quality = 20; 
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 14;
     config.fb_count = 2; 
     config.fb_location = CAMERA_FB_IN_PSRAM;
   } else {
     config.frame_size = FRAMESIZE_QVGA; 
-    config.jpeg_quality = 25; 
+    config.jpeg_quality = 18;
     config.fb_count = 1; 
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
@@ -421,7 +560,7 @@ void setup() {
   else {
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-      s->set_quality(s, 20);
+      s->set_quality(s, 16);
       s->set_contrast(s, 1);
       s->set_brightness(s, 1);
       s->set_saturation(s, 1);
@@ -429,6 +568,13 @@ void setup() {
     }
     lcd.clear(); lcd.print("Cam Init OK!"); delay(1000);
   }
+
+  // Servo dung PWM timer rieng de khong xung dot voi LEDC timer cua camera.
+  ESP32PWM::allocateTimer(1);
+  myServo.setPeriodHertz(50);
+  myServo.attach(SERVO_PIN, 500, 2400);
+  myServo.write(0);
+  vTaskDelay(500 / portTICK_PERIOD_MS);
   
   WiFi.begin(ssid, password);
   lcd.clear(); lcd.print("Ket noi WiFi...");
@@ -444,15 +590,19 @@ void setup() {
     Serial.println("mDNS start failed");
   }
   
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
   startCameraServer();
   
   eventQueue = xQueueCreate(10, sizeof(SystemEvent));
-  telegramQueue = xQueueCreate(5, 128);
+  telegramQueue = xQueueCreate(2, 128);
+  faceAuthSemaphore = xSemaphoreCreateBinary();
   
-  xTaskCreatePinnedToCore(keypadTask, "KeypadTask", 2048, NULL, 2, NULL, 1); 
-  xTaskCreatePinnedToCore(systemControlTask, "ControlTask", 8192, NULL, 3, NULL, 1);
-  xTaskCreatePinnedToCore(apiTask, "ApiTask", 4096, NULL, 1, NULL, 1); 
+  xTaskCreatePinnedToCore(keypadTask, "KeypadTask", 2048, NULL, 3, NULL, 1); 
+  xTaskCreatePinnedToCore(systemControlTask, "ControlTask", 8192, NULL, 2, NULL, 1);
+
+  xTaskCreatePinnedToCore(apiTask, "ApiTask", 4096, NULL, 1, NULL, 0); 
   xTaskCreatePinnedToCore(telegramTask, "TelegramTask", 6144, NULL, 1, NULL, 0); 
+  xTaskCreatePinnedToCore(faceAuthTask, "FaceAuthTask", 8192, NULL, 1, NULL, 0);
   
   displayDefault(); 
   vTaskDelete(NULL); 

@@ -1,0 +1,13 @@
+RewriteEngine On
+RewriteBase /
+
+# Proxy API requests to Flask server
+
+RewriteCond %{REQUEST_URI} ^/api/
+RewriteRule ^api/(.\*)$ http://localhost:5000/api/$1 [P,L]
+
+# Only rewrite to index.php if file doesn't exist and it's not an API request
+
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_URI} !^/api/
+RewriteRule ^ index.php [QSA,L]
