@@ -101,6 +101,7 @@ bool enqueueRemoteCommand(const char* cmd);
 void runFaceAuth();
 void beepTwice();
 
+// The buzzer will beep twice if an error is made.
 void beepTwice() {
   for (int i = 0; i < 2; i++) {
     digitalWrite(BUZZER_PIN, HIGH);
@@ -110,6 +111,7 @@ void beepTwice() {
   }
 }
 
+// Sending Telegram messages asynchronously
 void sendTelegramAsync(const char* message) {
   if (telegramQueue != NULL) {
     char msgBuffer[128];
@@ -119,6 +121,7 @@ void sendTelegramAsync(const char* message) {
   }
 }
 
+// Printing text onto LCD screens safely.
 void lcdPrint(const char* l1, const char* l2) {
   if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
     lcd.clear(); 
@@ -130,6 +133,7 @@ void lcdPrint(const char* l1, const char* l2) {
   }
 }
 
+// Display default screen
 void displayDefault() {
   if (currentState == STATE_LOCKED_OUT) return;
 
@@ -150,6 +154,7 @@ void displayDefault() {
   }
 }
 
+// Open the door
 void openDoor() {
   Serial.println(" Cửa mở!");
   digitalWrite(BUZZER_PIN, HIGH);
@@ -164,6 +169,7 @@ void openDoor() {
 
 }
 
+// Close the door
 void closeDoor() {
   Serial.println("Cửa đóng!");
   myServo.write(0);
@@ -173,6 +179,7 @@ void closeDoor() {
   displayDefault();
 }
 
+// Logic when click button D
 void runFaceAuth() {
   // For keypad D flow: capture once, then keep camera OFF until user turns it on again.
   if (!cameraEnabled) {
@@ -196,7 +203,7 @@ void runFaceAuth() {
 
   lcdPrint("DANG NHAN DIEN", "VUI LONG DOI...");
 
-  // Warm-up frames de giam anh cu/anh mo truoc khi gui len server.
+  // Warm-up frames are used to reduce the size of old/flashed images before uploading them to the server
   for (int i = 0; i < 2; i++) {
     camera_fb_t *warmup = esp_camera_fb_get();
     if (warmup) {
@@ -282,16 +289,16 @@ void runFaceAuth() {
   displayDefault();
 }
 
+// Face recognition waiting queue (i.e., waiting for the D key to be pressed)
 void faceAuthTask(void *pvParameters) {
   while(1) {
-    // Chờ tín hiệu từ nút bấm (chờ vô tận không tốn CPU)
     if (xSemaphoreTake(faceAuthSemaphore, portMAX_DELAY) == pdTRUE) {
-       // Khi nhận được tín hiệu, mới bắt đầu chạy hàm nhận diện
        runFaceAuth(); 
     }
   }
 }
 
+// Processing control commands
 void processCommand(const char* cmdIn) {
   char cmd[16];
   strncpy(cmd, cmdIn, sizeof(cmd) - 1);
@@ -318,6 +325,7 @@ void processCommand(const char* cmdIn) {
   }
 }
 
+// Add remote commands to the queue.
 bool enqueueRemoteCommand(const char* cmd) {
   if (!cmd || cmd[0] == '\0' || !eventQueue) return false;
   SystemEvent evt;
@@ -328,6 +336,7 @@ bool enqueueRemoteCommand(const char* cmd) {
   return xQueueSend(eventQueue, &evt, 0) == pdTRUE;
 }
 
+// Control key operations
 void processKey(char key) {
   Serial.print("Key Processed: "); Serial.println(key); 
 
@@ -402,7 +411,7 @@ void processKey(char key) {
           currentPassword[sizeof(currentPassword) - 1] = '\0'; 
           lcdPrint("DOI PASS OK!", ""); vTaskDelay(2000 / portTICK_PERIOD_MS);
           inputBuffer[0] = '\0'; currentState = STATE_IDLE; displayDefault();
-          sendTelegramAsync("Mật khẩu vừa được thay đổi!"); // Thông báo đổi pass
+          sendTelegramAsync("Mật khẩu vừa được thay đổi!");
         } else {
           lcdPrint("PASS KO KHOP!", ""); vTaskDelay(2000 / portTICK_PERIOD_MS);
           inputBuffer[0] = '\0'; currentState = STATE_IDLE; displayDefault(); 
@@ -414,6 +423,7 @@ void processKey(char key) {
   }
 }
 
+// Continuous keyboard scan
 void keypadTask(void *pvParameters) {
   static char taskLastKey = '\0';
   while(1) {

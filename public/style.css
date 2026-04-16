@@ -108,6 +108,10 @@ body::before {
   animation: shimmer 3s linear infinite;
 }
 
+.container.login-mode::before {
+  display: none;
+}
+
 @keyframes shimmer {
   0% {
     background-position: -200% 0;
@@ -153,6 +157,7 @@ h2 {
 
 /* 4. Form input */
 input[type="email"],
+input[type="text"],
 input[type="password"] {
   width: 100%;
   padding: 16px 18px;
@@ -648,6 +653,89 @@ h4 {
   font-weight: 600;
   font-size: 14px;
   color: var(--text-main);
+}
+
+.center-popup {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) scale(0.96);
+  background: #ffffff;
+  border-radius: 14px;
+  padding: 18px 22px;
+  min-width: 280px;
+  max-width: calc(100vw - 40px);
+  border: 2px solid #fca5a5;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.25);
+  z-index: 10010;
+  color: #991b1b;
+  font-weight: 700;
+  text-align: center;
+  opacity: 0;
+  transition: all 0.2s ease;
+}
+
+.center-popup.show {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+}
+
+.user-create-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 12px 0 14px;
+}
+
+.user-create-grid .setting-select {
+  margin: 10px 0;
+}
+
+.user-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+
+.user-item:last-child {
+  margin-bottom: 0;
+}
+
+.user-meta {
+  min-width: 0;
+}
+
+.user-name {
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.user-sub {
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.user-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.btn-small {
+  width: auto;
+  margin-top: 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 /* 12. Tab Navigation */
@@ -1483,6 +1571,17 @@ body.dark-mode .toast span {
   color: #f9fafb;
 }
 
+body.dark-mode .center-popup {
+  background: #1f2937;
+  color: #fecaca;
+  border-color: #ef4444;
+}
+
+body.dark-mode .user-item {
+  background: #1f2937;
+  border-color: #4b5563;
+}
+
 body.dark-mode .camera-ip-info {
   background: #374151;
   border: 1px solid #4b5563;
@@ -1563,5 +1662,9 @@ body.dark-mode .face-storage-hint {
 
   .toast {
     min-width: auto;
+  }
+
+  .user-create-grid {
+    grid-template-columns: 1fr;
   }
 }
