@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import json
+import secrets
 import subprocess
 import tempfile
 import requests
@@ -14,6 +15,7 @@ from PIL import Image
 import io
 import hashlib
 import binascii
+from functools import wraps
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -26,14 +28,9 @@ from config.env import APP_CONFIG
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# =============== LM393 IR STATE (in-memory) ===============
-# Lưu trạng thái cảm biến để frontend hỏi lại
-_ir_state = {
-    "state": "waiting",        # "waiting" | "detecting"
-    "updated_at": time.time()  # thời điểm cập nhật gần nhất (unix timestamp)
-}
-
 _fallback_log_file = os.path.join(os.path.dirname(__file__), 'public', 'activity_fallback.jsonl')
+_web_sessions = {}
+_session_ttl_seconds = 12 * 60 * 60
 
 
 # ==================== UTILITY FUNCTIONS ====================
@@ -161,7 +158,270 @@ def _serialize_log_rows(rows):
         serialized.append(item)
     return serialized
 
+def _serialize_user_rows(rows):
+    """Convert DB datetime objects in users rows to stable strings."""
+    if not isinstance(rows, list):
+        return rows
+
+    serialized = []
+    for row in rows:
+        item = dict(row)
+        for key in ('created_at', 'last_login'):
+            value = item.get(key)
+            if hasattr(value, 'strftime'):
+                item[key] = value.strftime('%Y-%m-%d %H:%M:%S')
+        serialized.append(item)
+    return serialized
+
+def _hash_password(raw_password):
+    """Hash password using SHA-256 for web login."""
+    return hashlib.sha256(str(raw_password or '').encode('utf-8')).hexdigest()
+
+def _extract_bearer_token():
+    """Read Bearer token from Authorization header."""
+    auth_header = request.headers.get('Authorization', '').strip()
+    if not auth_header.startswith('Bearer '):
+        return None
+    token = auth_header[7:].strip()
+    return token or None
+
+def _get_current_web_user():
+    """Resolve current logged-in user from session token."""
+    token = _extract_bearer_token()
+    if not token:
+        return None
+
+    session = _web_sessions.get(token)
+    if not session:
+        return None
+
+    expires_at = session.get('expires_at', 0)
+    if time.time() > expires_at:
+        _web_sessions.pop(token, None)
+        return None
+
+    return session.get('user')
+
+def require_web_auth(f):
+    """Decorator to require valid web login token."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = _get_current_web_user()
+        if not user:
+            return error_response('Unauthorized. Please login.', 401)
+        request.current_user = user
+        return f(*args, **kwargs)
+    return decorated_function
+
+def require_role(*allowed_roles):
+    """Decorator to require specific role(s) for web user."""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user = _get_current_web_user()
+            if not user:
+                return error_response('Unauthorized. Please login.', 401)
+
+            role = str(user.get('role', 'user')).lower()
+            if role not in allowed_roles:
+                return error_response('Forbidden. Insufficient permissions.', 403)
+
+            request.current_user = user
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
 # ==================== API ROUTES ====================
+
+@app.route('/api/auth/login', methods=['POST'])
+def web_login():
+    """Web login endpoint (username/password) with role response."""
+    try:
+        data = request.get_json() or request.form.to_dict()
+        username = str(data.get('username', '')).strip()
+        password = str(data.get('password', '')).strip()
+
+        if not username or not password:
+            return error_response('Missing username or password', 400)
+
+        user_row = execute_query(
+            '''SELECT id, username, role, is_active, password_hash
+               FROM users
+               WHERE username = %s
+               LIMIT 1''',
+            (username,),
+            fetch_one=True
+        )
+
+        if not user_row:
+            return error_response('Invalid username or password', 401)
+
+        if int(user_row.get('is_active') or 0) != 1:
+            return error_response('Account is disabled', 403)
+
+        expected_hash = user_row.get('password_hash')
+        if expected_hash != _hash_password(password):
+            return error_response('Invalid username or password', 401)
+
+        execute_query(
+            'UPDATE users SET last_login = NOW() WHERE id = %s',
+            (user_row['id'],)
+        )
+
+        token = secrets.token_hex(32)
+        expires_at = time.time() + _session_ttl_seconds
+        _web_sessions[token] = {
+            'user': {
+                'id': user_row['id'],
+                'username': user_row['username'],
+                'role': user_row['role'],
+            },
+            'expires_at': expires_at,
+        }
+
+        return success_response({
+            'token': token,
+            'expires_in': _session_ttl_seconds,
+            'user': {
+                'id': user_row['id'],
+                'username': user_row['username'],
+                'role': user_row['role'],
+            }
+        })
+    except Exception as e:
+        return error_response(f'Login error: {str(e)}', 500)
+
+@app.route('/api/admin/users', methods=['GET'])
+@require_role('admin')
+def admin_get_users():
+    """Admin endpoint to list all web login users."""
+    users = execute_query(
+        '''SELECT id, username, role, is_active, created_at, last_login
+           FROM users
+           ORDER BY id DESC''',
+        fetch_all=True
+    )
+    return success_response({'users': _serialize_user_rows(users)})
+
+@app.route('/api/admin/users', methods=['POST'])
+@require_role('admin')
+def admin_create_user():
+    """Admin endpoint to create a new web login user."""
+    try:
+        data = request.get_json() or request.form.to_dict()
+        username = str(data.get('username', '')).strip()
+        raw_password = str(data.get('password', '')).strip()
+        role = str(data.get('role', 'user')).strip().lower() or 'user'
+
+        if not username or not raw_password:
+            return error_response('Username and password are required', 400)
+
+        if len(username) < 3 or len(username) > 64:
+            return error_response('Username must be 3-64 characters', 400)
+
+        if len(raw_password) < 3:
+            return error_response('Password must be at least 3 characters', 400)
+
+        import re
+        if not re.match(r'^[a-zA-Z0-9_.-]+$', username):
+            return error_response('Username can only contain letters, numbers, dot, underscore, hyphen', 400)
+
+        if role not in ('admin', 'user'):
+            return error_response('Role must be admin or user', 400)
+
+        exists = execute_query(
+            'SELECT id FROM users WHERE username = %s LIMIT 1',
+            (username,),
+            fetch_one=True
+        )
+        if exists:
+            return error_response('Username already exists', 409)
+
+        execute_query(
+            '''INSERT INTO users (username, password_hash, role, is_active)
+               VALUES (%s, %s, %s, 1)''',
+            (username, _hash_password(raw_password), role)
+        )
+
+        return success_response({'message': 'User created successfully'})
+    except Exception as e:
+        return error_response(f'Create user error: {str(e)}', 500)
+
+@app.route('/api/admin/users/<int:user_id>/role', methods=['PUT'])
+@require_role('admin')
+def admin_update_user_role(user_id):
+    """Admin endpoint to change a user's role."""
+    data = request.get_json() or request.form.to_dict()
+    role = str(data.get('role', '')).strip().lower()
+
+    if role not in ('admin', 'user'):
+        return error_response('Role must be admin or user', 400)
+
+    current_user = getattr(request, 'current_user', {}) or {}
+    if int(current_user.get('id') or 0) == int(user_id):
+        return error_response('Cannot change your own role', 400)
+
+    target = execute_query(
+        'SELECT id FROM users WHERE id = %s LIMIT 1',
+        (user_id,),
+        fetch_one=True
+    )
+    if not target:
+        return error_response('User not found', 404)
+
+    execute_query(
+        'UPDATE users SET role = %s WHERE id = %s',
+        (role, user_id)
+    )
+    return success_response({'message': 'Role updated'})
+
+@app.route('/api/admin/users/<int:user_id>/status', methods=['PUT'])
+@require_role('admin')
+def admin_update_user_status(user_id):
+    """Admin endpoint to lock/unlock a user account."""
+    data = request.get_json() or request.form.to_dict()
+    is_active = data.get('is_active')
+
+    if str(is_active) not in ('0', '1'):
+        return error_response('is_active must be 0 or 1', 400)
+
+    is_active = int(is_active)
+    current_user = getattr(request, 'current_user', {}) or {}
+    if int(current_user.get('id') or 0) == int(user_id) and is_active == 0:
+        return error_response('Cannot deactivate your own account', 400)
+
+    target = execute_query(
+        'SELECT id FROM users WHERE id = %s LIMIT 1',
+        (user_id,),
+        fetch_one=True
+    )
+    if not target:
+        return error_response('User not found', 404)
+
+    execute_query(
+        'UPDATE users SET is_active = %s WHERE id = %s',
+        (is_active, user_id)
+    )
+    return success_response({'message': 'Status updated'})
+
+@app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
+@require_role('admin')
+def admin_delete_user(user_id):
+    """Admin endpoint to delete a user account."""
+    current_user = getattr(request, 'current_user', {}) or {}
+    if int(current_user.get('id') or 0) == int(user_id):
+        return error_response('Cannot delete your own account', 400)
+
+    target = execute_query(
+        'SELECT id FROM users WHERE id = %s LIMIT 1',
+        (user_id,),
+        fetch_one=True
+    )
+    if not target:
+        return error_response('User not found', 404)
+
+    execute_query('DELETE FROM users WHERE id = %s', (user_id,))
+    return success_response({'message': 'User deleted'})
 
 @app.route('/api/devices', methods=['GET'])
 @require_api_key
@@ -531,6 +791,7 @@ def draw_overlay():
 
 @app.route('/api/add-face', methods=['POST'])
 @app.route('/api/add_face', methods=['POST'])
+@require_role('admin')
 def add_face():
     """
     Add new face to database
@@ -638,7 +899,7 @@ def add_face():
     except Exception as e:
         return error_response(f'Server error: {str(e)}', 500)
 
-@app.route('/api/access-log', methods=['POST'])
+@app.route('/api/access-log', methods=['GET'])
 def get_logs():
     """Get access logs - Public endpoint for frontend polling"""
     limit = int(request.args.get('limit', 100))
@@ -652,6 +913,7 @@ def get_logs():
     return json_response({'ok': True, 'data': _serialize_log_rows(logs)})
 
 @app.route('/api/logs', methods=['GET', 'POST', 'DELETE'])
+@require_web_auth
 def logs_endpoint():
     """Handle both GET (query logs) and POST (create log) - Public endpoint"""
     if request.method == 'GET':
@@ -740,116 +1002,6 @@ def add_log():
     except Exception as e:
         return error_response(f'Failed to save log: {str(e)}', 500)
 
-# ---- IR state endpoint: ESP32 update + frontend query ----
-@app.route('/api/ir-state', methods=['GET'])
-def ir_state():
-    """
-    Hai chế độ trong cùng 1 endpoint:
-    - ESP32:  GET /api/ir-state?state=waiting|detecting  -> cập nhật trạng thái
-    - Web:    GET /api/ir-state                         -> lấy trạng thái hiện tại
-    """
-    global _ir_state
-
-    state_param = request.args.get('state', type=str)
-
-    # 1) ESP32 gửi trạng thái mới
-    if state_param is not None:
-        state_param = state_param.lower()
-        if state_param not in ("waiting", "detecting"):
-            return error_response("Invalid state", 400)
-
-        _ir_state["state"] = state_param
-        _ir_state["updated_at"] = time.time()
-        print(f"[IR] Update state from ESP32 -> {_ir_state['state']}")
-        return success_response({"state": _ir_state["state"]})
-
-    # 2) Frontend hỏi trạng thái hiện tại
-    age = time.time() - _ir_state["updated_at"]
-
-    # Nếu đang "detecting" quá lâu (ESP32 im lặng) thì tự reset về "waiting"
-    if _ir_state["state"] == "detecting" and age > 10:
-        _ir_state["state"] = "waiting"
-
-    return success_response({
-        "state": _ir_state["state"],
-        "age": age
-    })
-
-
-@app.route('/api/sensor/config', methods=['GET'])
-@require_api_key
-def get_sensor_config():
-    """Get LM393 sensor configuration"""
-    config = {
-        'lm393_enabled': APP_CONFIG.get('lm393_enabled', True),
-        'lm393_cooldown_ms': APP_CONFIG.get('lm393_cooldown_ms', 5000),
-        'save_unlock_photos': APP_CONFIG.get('save_unlock_photos', True),
-        'tolerance': APP_CONFIG.get('tolerance', 0.6)
-    }
-    
-    return json_response({'config': config})
-
-@app.route('/api/sensor/stats', methods=['GET'])
-@require_api_key
-def get_sensor_stats():
-    """Get sensor statistics from database"""
-    # Statistics for last 24 hours
-    stats = execute_query('''
-        SELECT 
-            COUNT(*) as total_detections,
-            SUM(CASE WHEN status = 'granted' THEN 1 ELSE 0 END) as granted,
-            SUM(CASE WHEN status = 'denied' THEN 1 ELSE 0 END) as denied,
-            AVG(confidence) as avg_confidence
-        FROM access_logs 
-        WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-    ''', fetch_one=True)
-    
-    # Recent detections
-    recent = execute_query('''
-        SELECT id, device_id, recognized_name, confidence, status, photo_url, timestamp
-        FROM access_logs 
-        ORDER BY timestamp DESC 
-        LIMIT 10
-    ''', fetch_all=True)
-    
-    return json_response({
-        'stats': stats,
-        'recent_detections': recent
-    })
-
-@app.route('/api/sensor-status', methods=['GET'])
-def get_sensor_status_realtime():
-    """Get realtime sensor status from ESP32"""
-    try:
-        ip = get_esp_ip()
-        
-        # Try to get sensor status from ESP32
-        try:
-            url = f"http://{ip}/sensor"
-            response = requests.get(url, timeout=1)
-            
-            if response.status_code == 200:
-                # Parse JSON response from ESP32
-                data = response.json()
-                return success_response({
-                    'detected': data.get('detected', False),
-                    'value': data.get('value', 0),
-                    'timestamp': data.get('timestamp', '')
-                })
-        except:
-            # ESP32 endpoint not available, return default
-            pass
-        
-        # Default response when ESP32 doesn't have /sensor endpoint
-        return success_response({
-            'detected': False,
-            'value': 0,
-            'note': 'ESP32 sensor endpoint not available'
-        })
-        
-    except Exception as e:
-        return error_response(f'Sensor check error: {str(e)}', 500)
-
 @app.route('/api/access-log', methods=['POST'])
 def create_access_log():
     """Create access log entry - for manual face check from web"""
@@ -888,7 +1040,7 @@ def create_access_log():
 def face_unlock_endpoint():
     """
     Face unlock API - Nhận diện khuôn mặt tự động từ ESP32
-    Được gọi khi cảm biến LM393 phát hiện chuyển động
+    Nhận ảnh JPEG từ ESP32 và trả về kết quả nhận diện
     """
     try:
         # Get image from request body (raw JPEG from ESP32)
@@ -969,7 +1121,7 @@ def face_unlock_endpoint():
             # Backward-compatible mapping for old DB enum (no keypad_d value).
             if source == 'keypad_d':
                 source = 'esp32_auto'
-            if source not in ('esp32_auto', 'web_manual', 'lm393_auto', 'unknown'):
+            if source not in ('esp32_auto', 'web_manual', 'unknown'):
                 source = 'esp32_auto'
 
             try:
@@ -1072,6 +1224,7 @@ def door_status():
         return error_response(f'Status error: {str(e)}', 500)
 
 @app.route('/api/faces', methods=['GET'])
+@require_role('admin')
 def get_faces():
     """Get all registered faces"""
     try:
@@ -1122,6 +1275,7 @@ def get_face_photo(name):
         return error_response(f'Photo error: {str(e)}', 500)
 
 @app.route('/api/faces/<name>', methods=['PUT'])
+@require_role('admin')
 def update_face(name):
     """Update face name"""
     try:
@@ -1159,6 +1313,7 @@ def update_face(name):
         return error_response(f'Update error: {str(e)}', 500)
 
 @app.route('/api/faces/<name>', methods=['DELETE'])
+@require_role('admin')
 def delete_face(name):
     """Delete face"""
     try:
@@ -1195,6 +1350,7 @@ def delete_face(name):
         return error_response(f'Delete error: {str(e)}', 500)
 
 @app.route('/api/faces/<name>/images', methods=['GET'])
+@require_role('admin')
 def get_face_images(name):
     """Get all images for a face"""
     try:
@@ -1231,6 +1387,7 @@ def get_face_image(name, filename):
         return error_response(f'Get image error: {str(e)}', 500)
 
 @app.route('/api/faces/<name>/images/<filename>', methods=['DELETE'])
+@require_role('admin')
 def delete_face_image(name, filename):
     """Delete specific image for a face"""
     try:
@@ -1268,6 +1425,7 @@ def delete_face_image(name, filename):
         return error_response(f'Delete image error: {str(e)}', 500)
 
 @app.route('/api/faces/<name>/images', methods=['POST'])
+@require_role('admin')
 def upload_face_images(name):
     """Upload new images for a face"""
     try:

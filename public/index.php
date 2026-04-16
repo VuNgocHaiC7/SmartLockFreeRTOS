@@ -15,6 +15,7 @@
 <body>
   <!-- Toast Notification Container -->
   <div id="toast-container"></div>
+  <div id="center-popup" class="center-popup hidden"></div>
 
   <div class="container">
     <div id="login-screen">
@@ -23,7 +24,7 @@
         <i class="fas fa-shield-alt"></i> Điều Khiển Khóa Thông Minh FreeRTOS
       </p>
 
-      <input type="email" id="email" placeholder="Nhập địa chỉ email..." />
+      <input type="text" id="username" placeholder="Nhập username..." />
       <input
         type="password"
         id="password"
@@ -93,7 +94,7 @@
           </div>
         </div>
 
-        <div class="settings-section face-storage-section">
+        <div id="face-add-section" class="settings-section face-storage-section">
           <h4 class="face-storage-title">
             <i class="fas fa-camera"></i> Thêm Ảnh Khuôn Mặt Từ Camera
           </h4>
@@ -225,7 +226,7 @@
 
         </div>
 
-        <div class="settings-section face-storage-section">
+        <div id="face-manage-section" class="settings-section face-storage-section">
           <h4 class="face-storage-title">
             <i class="fas fa-users"></i> Danh Sách Khuôn Mặt Đã Lưu
           </h4>
@@ -242,11 +243,53 @@
           </div>
         </div>
 
-        <div class="danger-zone">
+        <div id="danger-zone" class="danger-zone">
           <h4><i class="fas fa-exclamation-triangle"></i> Vùng nguy hiểm</h4>
           <button class="btn btn-danger" onclick="clearAllLogs()">
             <i class="fas fa-trash"></i><span>Xóa tất cả nhật ký</span>
           </button>
+        </div>
+
+        <div id="user-manage-section" class="settings-section face-storage-section">
+          <h4 class="face-storage-title">
+            <i class="fas fa-user-shield"></i> Quản Lý Tài Khoản
+          </h4>
+
+          <div class="face-storage-hint">
+            Chỉ admin mới có quyền tạo và quản lý tài khoản đăng nhập.
+          </div>
+
+          <div class="user-create-grid">
+            <input
+              type="text"
+              id="new-username-input"
+              class="face-name-input"
+              placeholder="Username mới..." />
+            <input
+              type="password"
+              id="new-password-input"
+              class="face-name-input"
+              placeholder="Mật khẩu..." />
+            <select id="new-role-select" class="setting-select">
+              <option value="user" selected>User</option>
+              <option value="admin">Admin</option>
+            </select>
+            <button class="btn btn-primary" onclick="createUserAccount()">
+              <i class="fas fa-user-plus"></i>
+              <span>Tạo User</span>
+            </button>
+          </div>
+
+          <div class="face-storage-list-header">
+            <span>Danh sách tài khoản</span>
+            <button class="btn btn-outline face-refresh-btn" onclick="loadUserAccounts()">
+              Tải lại
+            </button>
+          </div>
+
+          <div id="users-list" class="face-storage-list">
+            <div class="loading-text">Đang tải danh sách tài khoản...</div>
+          </div>
         </div>
       </div>
     </div>

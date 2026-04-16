@@ -26,35 +26,126 @@ let isCameraUiOn = false;
 let isFaceAuthRunning = false;
 let isFaceStorageLoading = false;
 let isAddingFace = false;
+let authToken = localStorage.getItem("smartLockAuthToken") || "";
+let currentUserRole = localStorage.getItem("smartLockUserRole") || "user";
+let currentUsername = localStorage.getItem("smartLockUsername") || "";
 
-// ==================== AUTHENTICATION (MOCK LOCAL) ====================
+// ==================== AUTHENTICATION ====================
+
+function getAuthHeaders() {
+  return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+}
+
+function applyRoleUi() {
+  const isAdmin = currentUserRole === "admin";
+  const faceAddSection = document.getElementById("face-add-section");
+  const faceManageSection = document.getElementById("face-manage-section");
+  const dangerZone = document.getElementById("danger-zone");
+  const userManageSection = document.getElementById("user-manage-section");
+
+  if (faceAddSection) {
+    faceAddSection.classList.toggle("hidden", !isAdmin);
+  }
+  if (faceManageSection) {
+    faceManageSection.classList.toggle("hidden", !isAdmin);
+  }
+  if (dangerZone) {
+    dangerZone.classList.toggle("hidden", !isAdmin);
+  }
+  if (userManageSection) {
+    userManageSection.classList.toggle("hidden", !isAdmin);
+  }
+}
+
+function setLoginVisualMode(isLoginMode) {
+  const container = document.querySelector(".container");
+  if (!container) return;
+  container.classList.toggle("login-mode", isLoginMode);
+}
+
+window.showCenterPopup = (message) => {
+  const popup = document.getElementById("center-popup");
+  if (!popup) return;
+
+  popup.textContent = message;
+  popup.classList.remove("hidden");
+  requestAnimationFrame(() => popup.classList.add("show"));
+
+  setTimeout(() => {
+    popup.classList.remove("show");
+    setTimeout(() => popup.classList.add("hidden"), 220);
+  }, 2300);
+};
 
 window.handleLogin = () => {
-  const email = document.getElementById("email").value.trim();
+  const username = document.getElementById("username").value.trim();
   const pass = document.getElementById("password").value.trim();
 
-  if (email === "" || pass === "") {
-    ui.loginMsg.innerText = "Vui lòng nhập Email và Mật khẩu!";
+  if (username === "" || pass === "") {
+    ui.loginMsg.innerText = "Vui lòng nhập username và mật khẩu!";
     return;
   }
 
-  ui.loginMsg.innerText = "Đang kết nối mạng Local...";
+  ui.loginMsg.innerText = "Đang đăng nhập...";
 
-  // Giả lập độ trễ đăng nhập 0.5s cho giống thật
-  setTimeout(async () => {
-    ui.loginScreen.classList.add("hidden");
-    ui.dashScreen.classList.remove("hidden");
-    ui.statusDot.classList.add("online");
-    document.getElementById("user-email").innerText = email;
+  (async () => {
+    try {
+      const response = await fetchWithFallback("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password: pass }),
+      });
 
-    await initLocalController();
-    startCameraStatusSync();
-    startHistorySync();
-    loadHistory();
-    initChart();
-    loadFacesStorage();
-    showToast("Đăng nhập mạng Local thành công!", "success");
-  }, 500);
+      const payload = await response.json();
+      if (!payload?.ok || !payload?.token) {
+        throw new Error(payload?.error || "Đăng nhập thất bại");
+      }
+
+      authToken = payload.token;
+      currentUserRole = payload?.user?.role || "user";
+      currentUsername = payload?.user?.username || username;
+
+      localStorage.setItem("smartLockAuthToken", authToken);
+      localStorage.setItem("smartLockUserRole", currentUserRole);
+      localStorage.setItem("smartLockUsername", currentUsername);
+
+      applyRoleUi();
+      setLoginVisualMode(false);
+
+      ui.loginScreen.classList.add("hidden");
+      ui.dashScreen.classList.remove("hidden");
+      ui.statusDot.classList.add("online");
+      document.getElementById("user-email").innerText =
+        `${currentUsername} (${currentUserRole})`;
+
+      await initLocalController();
+      startCameraStatusSync();
+      startHistorySync();
+      loadHistory();
+      initChart();
+      if (currentUserRole === "admin") {
+        loadFacesStorage();
+        loadUserAccounts();
+      }
+      showToast("Đăng nhập thành công!", "success");
+      ui.loginMsg.innerText = "";
+    } catch (error) {
+      console.error("Login failed:", error);
+      const loginErrorText = String(error?.message || "");
+      const invalidCreds =
+        loginErrorText.includes("Invalid username or password") ||
+        loginErrorText.includes('"error":"Invalid username or password"');
+
+      if (invalidCreds) {
+        ui.loginMsg.innerText = "Sai username hoặc mật khẩu";
+        showCenterPopup("Sai thông tin đăng nhập");
+      } else {
+        ui.loginMsg.innerText = "Không thể kết nối server đăng nhập";
+      }
+
+      showToast("Đăng nhập thất bại", "error");
+    }
+  })();
 };
 
 window.handleLogout = () => {
@@ -64,6 +155,14 @@ window.handleLogout = () => {
   ui.dashScreen.classList.add("hidden");
   ui.statusDot.classList.remove("online");
   ui.loginMsg.innerText = "";
+  authToken = "";
+  currentUserRole = "user";
+  currentUsername = "";
+  localStorage.removeItem("smartLockAuthToken");
+  localStorage.removeItem("smartLockUserRole");
+  localStorage.removeItem("smartLockUsername");
+  applyRoleUi();
+  setLoginVisualMode(true);
   setCameraUiState(false);
 };
 
@@ -231,7 +330,10 @@ window.rediscoverController = async () => {
     await syncCameraStateOnce();
     showToast(`Da ket noi ESP32: ${found}`, "success");
   } else {
-    showToast("Khong ket noi duoc ESP32 co dinh 10.215.116.74", "error");
+    showToast(
+      `Khong ket noi duoc ESP32 co dinh ${FIXED_ESP_BASE_URL.replace("http://", "")}`,
+      "error",
+    );
   }
 };
 
@@ -244,7 +346,10 @@ async function initLocalController() {
     return;
   }
 
-  showToast("ESP32 10.215.116.74 chua san sang", "info");
+  showToast(
+    `ESP32 ${FIXED_ESP_BASE_URL.replace("http://", "")} chua san sang`,
+    "info",
+  );
 }
 
 function setCameraUiState(isOn, options = {}) {
@@ -369,7 +474,10 @@ async function sendLocalCommand(cmd) {
 
   const reachable = await pingController(espBaseUrl, 900);
   if (!reachable) {
-    showToast("Mat ket noi ESP32 10.215.116.74", "error");
+    showToast(
+      `Mat ket noi ESP32 ${FIXED_ESP_BASE_URL.replace("http://", "")}`,
+      "error",
+    );
     throw new Error("ESP32 unreachable");
   }
 
@@ -454,19 +562,30 @@ function getServerApiCandidates(pathWithQuery = "") {
 
 function getFacePhotoCandidates(name, photoUrl = "") {
   const encodedName = encodeURIComponent(name);
-  const baseCandidates = getServerApiCandidates(`/api/face-photo/${encodedName}`);
+  const baseCandidates = getServerApiCandidates(
+    `/api/face-photo/${encodedName}`,
+  );
   const candidates = photoUrl ? [photoUrl, ...baseCandidates] : baseCandidates;
-  return candidates.filter((value, index, arr) => value && arr.indexOf(value) === index);
+  return candidates.filter(
+    (value, index, arr) => value && arr.indexOf(value) === index,
+  );
 }
 
 async function fetchWithFallback(pathWithQuery, options = {}) {
   const candidates = getServerApiCandidates(pathWithQuery);
   let response = null;
   let lastError = null;
+  const requestOptions = {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      ...getAuthHeaders(),
+    },
+  };
 
   for (const endpoint of candidates) {
     try {
-      response = await fetch(endpoint, options);
+      response = await fetch(endpoint, requestOptions);
       if (response.ok) {
         return response;
       }
@@ -485,7 +604,8 @@ function renderFacesStorage(faces = []) {
   if (!list) return;
 
   if (!Array.isArray(faces) || faces.length === 0) {
-    list.innerHTML = "<div class='no-data'>Chưa có khuôn mặt nào trong kho dữ liệu</div>";
+    list.innerHTML =
+      "<div class='no-data'>Chưa có khuôn mặt nào trong kho dữ liệu</div>";
     return;
   }
 
@@ -494,7 +614,10 @@ function renderFacesStorage(faces = []) {
     .sort((a, b) => (a.name || "").localeCompare(b.name || "", "vi"))
     .forEach((face) => {
       const safeName = String(face.name || "Unknown");
-      const photoCandidates = getFacePhotoCandidates(safeName, face.photo_url || "");
+      const photoCandidates = getFacePhotoCandidates(
+        safeName,
+        face.photo_url || "",
+      );
       const photoSrc = photoCandidates[0] || "";
       const fallbackSrc = photoCandidates.slice(1).join("||");
       const item = document.createElement("div");
@@ -551,12 +674,17 @@ function renderFacesStorage(faces = []) {
 }
 
 async function loadFacesStorage() {
+  if (currentUserRole !== "admin") {
+    return;
+  }
+
   if (isFaceStorageLoading) return;
   isFaceStorageLoading = true;
 
   const list = document.getElementById("face-storage-list");
   if (list) {
-    list.innerHTML = "<div class='loading-text'>Đang tải danh sách khuôn mặt...</div>";
+    list.innerHTML =
+      "<div class='loading-text'>Đang tải danh sách khuôn mặt...</div>";
   }
 
   try {
@@ -569,7 +697,8 @@ async function loadFacesStorage() {
   } catch (error) {
     console.error("Load faces storage failed:", error);
     if (list) {
-      list.innerHTML = "<div class='no-data'>Không tải được danh sách khuôn mặt</div>";
+      list.innerHTML =
+        "<div class='no-data'>Không tải được danh sách khuôn mặt</div>";
     }
   } finally {
     isFaceStorageLoading = false;
@@ -577,6 +706,11 @@ async function loadFacesStorage() {
 }
 
 async function deleteFaceFromStorage(name) {
+  if (currentUserRole !== "admin") {
+    showToast("Bạn không có quyền xóa khuôn mặt", "error");
+    return;
+  }
+
   const ok = window.confirm(`Bạn có chắc muốn xóa khuôn mặt '${name}'?`);
   if (!ok) return;
 
@@ -606,7 +740,8 @@ async function addFaceToStorageByName(name) {
   });
   const capturePayload = await captureResponse.json();
 
-  const imageUrl = capturePayload && capturePayload.url ? capturePayload.url : "";
+  const imageUrl =
+    capturePayload && capturePayload.url ? capturePayload.url : "";
   if (!imageUrl) {
     throw new Error("Capture image URL not found");
   }
@@ -630,6 +765,11 @@ async function addFaceToStorageByName(name) {
 }
 
 window.addFaceFromEsp32 = async () => {
+  if (currentUserRole !== "admin") {
+    showToast("Bạn không có quyền thêm khuôn mặt", "error");
+    return;
+  }
+
   if (isAddingFace) {
     showToast("Hệ thống đang thêm khuôn mặt, vui lòng chờ", "info");
     return;
@@ -666,6 +806,189 @@ window.addFaceFromEsp32 = async () => {
 window.refreshFacesStorage = async () => {
   await loadFacesStorage();
 };
+
+function renderUserAccounts(users = []) {
+  const list = document.getElementById("users-list");
+  if (!list) return;
+
+  if (!Array.isArray(users) || users.length === 0) {
+    list.innerHTML = "<div class='no-data'>Chưa có tài khoản nào</div>";
+    return;
+  }
+
+  list.innerHTML = "";
+  users.forEach((user) => {
+    const item = document.createElement("div");
+    item.className = "user-item";
+    const roleLabel = user.role === "admin" ? "Admin" : "User";
+    const statusLabel =
+      Number(user.is_active) === 1 ? "Đang hoạt động" : "Đang khóa";
+
+    item.innerHTML = `
+      <div class="user-meta">
+        <div class="user-name">${user.username}</div>
+        <div class="user-sub">Vai trò: ${roleLabel} • ${statusLabel}</div>
+      </div>
+      <div class="user-actions">
+        <button class="btn btn-outline btn-small" data-role-id="${user.id}" data-role="${user.role}">
+          Đổi role
+        </button>
+        <button class="btn btn-warning btn-small" data-toggle-id="${user.id}" data-active="${user.is_active}">
+          ${Number(user.is_active) === 1 ? "Khóa" : "Mở"}
+        </button>
+        <button class="btn btn-danger btn-small" data-delete-id="${user.id}">
+          Xóa
+        </button>
+      </div>
+    `;
+
+    list.appendChild(item);
+  });
+
+  list.querySelectorAll("[data-role-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const userId = button.getAttribute("data-role-id");
+      const currentRole = button.getAttribute("data-role") || "user";
+      const nextRole = currentRole === "admin" ? "user" : "admin";
+      await updateUserRole(userId, nextRole);
+    });
+  });
+
+  list.querySelectorAll("[data-toggle-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const userId = button.getAttribute("data-toggle-id");
+      const active = Number(button.getAttribute("data-active")) === 1;
+      await setUserStatus(userId, !active);
+    });
+  });
+
+  list.querySelectorAll("[data-delete-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const userId = button.getAttribute("data-delete-id");
+      await deleteUserAccount(userId);
+    });
+  });
+}
+
+window.loadUserAccounts = async () => {
+  if (currentUserRole !== "admin") return;
+
+  const list = document.getElementById("users-list");
+  if (list) {
+    list.innerHTML =
+      "<div class='loading-text'>Đang tải danh sách tài khoản...</div>";
+  }
+
+  try {
+    const response = await fetchWithFallback("/api/admin/users", {
+      method: "GET",
+      cache: "no-store",
+    });
+    const payload = await response.json();
+    renderUserAccounts(payload.users || []);
+  } catch (error) {
+    console.error("Load users failed:", error);
+    if (list) {
+      list.innerHTML =
+        "<div class='no-data'>Không tải được danh sách tài khoản</div>";
+    }
+  }
+};
+
+window.createUserAccount = async () => {
+  if (currentUserRole !== "admin") {
+    showToast("Bạn không có quyền tạo user", "error");
+    return;
+  }
+
+  const usernameInput = document.getElementById("new-username-input");
+  const passwordInput = document.getElementById("new-password-input");
+  const roleSelect = document.getElementById("new-role-select");
+
+  const username = String(usernameInput?.value || "").trim();
+  const password = String(passwordInput?.value || "").trim();
+  const role = String(roleSelect?.value || "user")
+    .trim()
+    .toLowerCase();
+
+  if (!username || !password) {
+    showToast("Vui lòng nhập username và mật khẩu user mới", "error");
+    return;
+  }
+
+  try {
+    await fetchWithFallback("/api/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password, role }),
+    });
+
+    showToast(`Đã tạo tài khoản ${username}`, "success");
+    if (usernameInput) usernameInput.value = "";
+    if (passwordInput) passwordInput.value = "";
+    if (roleSelect) roleSelect.value = "user";
+    await loadUserAccounts();
+  } catch (error) {
+    console.error("Create user failed:", error);
+    showToast("Tạo user thất bại", "error");
+  }
+};
+
+async function updateUserRole(userId, role) {
+  try {
+    await fetchWithFallback(
+      `/api/admin/users/${encodeURIComponent(userId)}/role`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role }),
+      },
+    );
+
+    showToast("Đã cập nhật role", "success");
+    await loadUserAccounts();
+  } catch (error) {
+    console.error("Update role failed:", error);
+    showToast("Không cập nhật được role", "error");
+  }
+}
+
+async function setUserStatus(userId, isActive) {
+  try {
+    await fetchWithFallback(
+      `/api/admin/users/${encodeURIComponent(userId)}/status`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ is_active: isActive ? 1 : 0 }),
+      },
+    );
+
+    showToast("Đã cập nhật trạng thái user", "success");
+    await loadUserAccounts();
+  } catch (error) {
+    console.error("Set status failed:", error);
+    showToast("Không cập nhật được trạng thái user", "error");
+  }
+}
+
+async function deleteUserAccount(userId) {
+  if (!window.confirm("Bạn có chắc muốn xóa user này?")) {
+    return;
+  }
+
+  try {
+    await fetchWithFallback(`/api/admin/users/${encodeURIComponent(userId)}`, {
+      method: "DELETE",
+    });
+
+    showToast("Đã xóa user", "success");
+    await loadUserAccounts();
+  } catch (error) {
+    console.error("Delete user failed:", error);
+    showToast("Không xóa được user", "error");
+  }
+}
 
 async function runFaceAuthCheck() {
   if (isFaceAuthRunning) {
@@ -713,9 +1036,15 @@ async function runFaceAuthCheck() {
     );
 
     const result = await unlockResponse.json();
+    const resultJsonText = JSON.stringify(result);
+    console.log("[FaceUnlock] JSON response object:", result);
+    console.log("[FaceUnlock] JSON response text:", resultJsonText);
     if (result.recognized) {
       const matchedName = result.name || "unknown";
-      showToast(`Khuôn mặt trùng khớp với kho dữ liệu (${matchedName})`, "success");
+      showToast(
+        `Khuôn mặt trùng khớp với kho dữ liệu (${matchedName})`,
+        "success",
+      );
     } else {
       showToast("Khuôn mặt không trùng khớp với kho dữ liệu", "error");
     }
@@ -920,7 +1249,7 @@ function isRelevantServerHistoryItem(item) {
   const source = String(item.source || "").toLowerCase();
 
   const isUnlockEvent = title.includes("mở khóa") || title.includes("mo khoa");
-  const isFaceEvent = title.includes("face") || source === "esp32_auto" || source === "lm393_auto";
+  const isFaceEvent = title.includes("face") || source === "esp32_auto";
 
   return isUnlockEvent || isFaceEvent;
 }
@@ -994,7 +1323,8 @@ function renderHistoryFromServer(logs = []) {
 
   mapped.forEach((item, index) => {
     statsData.total++;
-    if (item.status === "granted" && item.dateValue > oneDayAgo) statsData.today++;
+    if (item.status === "granted" && item.dateValue > oneDayAgo)
+      statsData.today++;
     if (item.dateValue > oneWeekAgo) statsData.week++;
     if (item.dateValue > oneMonthAgo) statsData.month++;
     if (item.source.includes("camera")) statsData.cam++;
@@ -1057,7 +1387,9 @@ function renderHistoryFromLocalStorage() {
 
   const filteredLogs = logs.filter((item) => {
     const msg = String(item.msg || "").toLowerCase();
-    return msg.includes("face") || msg.includes("mở khóa") || msg.includes("mo khoa");
+    return (
+      msg.includes("face") || msg.includes("mở khóa") || msg.includes("mo khoa")
+    );
   });
 
   buildActivityChartData(filteredLogs.map((item) => item.timestamp));
@@ -1070,7 +1402,10 @@ function renderHistoryFromLocalStorage() {
 
     filteredLogs.forEach((item) => {
       statsData.total++;
-      if (item.timestamp > oneDayAgo && item.msg.toLowerCase().includes("mở khóa")) {
+      if (
+        item.timestamp > oneDayAgo &&
+        item.msg.toLowerCase().includes("mở khóa")
+      ) {
         statsData.today++;
       }
       if (item.timestamp > oneWeekAgo) statsData.week++;
@@ -1158,7 +1493,10 @@ window.switchTab = (tabName) => {
   event.target.closest(".tab-btn").classList.add("active");
 
   if (tabName === "settings") {
-    loadFacesStorage();
+    if (currentUserRole === "admin") {
+      loadFacesStorage();
+      loadUserAccounts();
+    }
   }
 };
 
@@ -1176,6 +1514,9 @@ window.toggleDarkMode = () => {
 if (localStorage.getItem("darkMode") === "true") {
   document.body.classList.add("dark-mode");
 }
+
+setLoginVisualMode(true);
+applyRoleUi();
 
 // ==================== TOAST NOTIFICATIONS ====================
 
@@ -1205,6 +1546,11 @@ window.showToast = (message, type = "info") => {
 // ==================== SETTINGS ====================
 
 window.clearAllLogs = () => {
+  if (currentUserRole !== "admin") {
+    showToast("Bạn không có quyền xóa nhật ký", "error");
+    return;
+  }
+
   if (!confirm("Bạn có chắc muốn xóa tất cả nhật ký hoạt động?")) {
     return;
   }
