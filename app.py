@@ -615,13 +615,15 @@ def face_check():
         script_path = os.path.join(APP_CONFIG['tools_dir'], 'face_check.py')
         db_path = APP_CONFIG['faces_db_dir']
         tolerance = APP_CONFIG['tolerance']
+        min_face_confidence = APP_CONFIG.get('min_face_confidence', 55.0)
         
         cmd = [
             python_bin,
             script_path,
             '--image', tmp_file.name,
             '--db', db_path,
-            '--tolerance', str(tolerance)
+            '--tolerance', str(tolerance),
+            '--min-confidence', str(min_face_confidence)
         ]
         
         # Execute Python script
@@ -1068,7 +1070,8 @@ def face_unlock_endpoint():
                 script_path,
                 '--image', tmp_file.name,
                 '--db', APP_CONFIG['faces_db_dir'],
-                '--tolerance', str(APP_CONFIG['tolerance'])
+                '--tolerance', str(APP_CONFIG['tolerance']),
+                '--min-confidence', str(APP_CONFIG.get('min_face_confidence', 55.0))
             ]
             
             result = subprocess.run(

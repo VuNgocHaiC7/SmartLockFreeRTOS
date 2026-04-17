@@ -72,7 +72,7 @@ SemaphoreHandle_t faceAuthSemaphore = NULL;
 
 const char* ssid = "Q";
 const char* password = "1709200004";
-const char* FACE_UNLOCK_URL = "http://10.172.42.224:5000/api/face-unlock?source=keypad_d&device_id=DOOR-01";
+const char* FACE_UNLOCK_URL = "http://10.157.220.224:5000/api/face-unlock?source=keypad_d&device_id=DOOR-01";
 
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1

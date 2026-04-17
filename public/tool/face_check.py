@@ -125,7 +125,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--image', required=True)
     ap.add_argument('--db', required=True)
-    ap.add_argument('--tolerance', type=float, default=0.8)
+    ap.add_argument('--tolerance', type=float, default=0.5)
+    ap.add_argument('--min-confidence', type=float, default=55.0)
     args = ap.parse_args()
 
     t0 = time.time()
@@ -209,7 +210,8 @@ def main():
         # Convert distance to confidence
         confidence = max(0, min(100, (1 - min_dist) * 100))
         
-        if min_dist <= args.tolerance:
+        # Strict match gate: require both distance and confidence thresholds.
+        if min_dist <= args.tolerance and confidence >= args.min_confidence:
             matched = True
             name = known_names[j]
         
