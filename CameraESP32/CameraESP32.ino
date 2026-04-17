@@ -15,7 +15,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h> 
 #include <freertos/queue.h> 
-#include <freertos/semphr.h> 
+#include <freertos/semphr.h>
+#include <Preferences.h> 
 
 extern void startCameraServer();
 
@@ -34,6 +35,7 @@ const char* CHAT_ID = "7624836973";
 LiquidCrystal_I2C lcd(LCD_ADDR, 16, 2);
 I2CKeyPad keypad(KEYPAD_ADDR); 
 Servo myServo;
+Preferences preferences;
 WebServer apiServer(8080); 
 
 SemaphoreHandle_t i2cMutex;
@@ -409,6 +411,9 @@ void processKey(char key) {
         if (strcmp(inputBuffer, tempNewPassword) == 0) {
           strncpy(currentPassword, inputBuffer, sizeof(currentPassword) - 1);
           currentPassword[sizeof(currentPassword) - 1] = '\0'; 
+
+          preferences.putString("password", String(currentPassword));
+
           lcdPrint("DOI PASS OK!", ""); vTaskDelay(2000 / portTICK_PERIOD_MS);
           inputBuffer[0] = '\0'; currentState = STATE_IDLE; displayDefault();
           sendTelegramAsync("Mật khẩu vừa được thay đổi!");
@@ -529,6 +534,13 @@ void systemControlTask(void *pvParameters) {
 }
 
 void setup() {
+
+  preferences.begin("lock_app", false);
+  String savedPass = preferences.getString("password", "1234");
+  
+  strncpy(currentPassword, savedPass.c_str(), sizeof(currentPassword) - 1);
+  currentPassword[sizeof(currentPassword) - 1] = '\0';
+
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
   Serial.begin(115200);
   
